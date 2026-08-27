@@ -193,10 +193,32 @@ constexpr uint32_t kFirstRowY = 84;
 constexpr uint32_t kRowSpacing = 27;
 constexpr int32_t kIconX = -4;
 constexpr uint32_t kIconSize = 22;
+// Neither column is fixed: achievement names and descriptions are localized and
+// their widths move a long way between languages (the Japanese ones are far
+// shorter than the English ones, the German ones longer). RefreshList measures
+// them once the text is set and lays the three columns out as one block --
+// icon, widest name, widest description -- centred in the safe area, so a short
+// language does not leave the whole list hugging the left edge. See
+// AlignRowColumns. The values here are the ones the widgets are created at,
+// before anything has been measured.
 constexpr uint32_t kNameX = 24;
-constexpr uint32_t kDescriptionX = 210;
+constexpr uint32_t kInitialDescriptionX = 210;
+// Space between the end of the longest name and the description column.
+constexpr uint32_t kDescriptionGap = 10;
+// Gap between the icon and the name column, kept constant as the block moves.
+constexpr uint32_t kIconGap = kNameX - static_cast<uint32_t>(kIconX + static_cast<int32_t>(kIconSize));
 constexpr float kNameScale = 0.70f;
 constexpr float kDescriptionScale = 0.58f;
+// Rows are laid out across the full-bleed span the backing panel already covers
+// rather than the 4:3 safe area, inset a little so nothing touches the edge.
+// Both spans are centred on 320, so this stays aligned with the heading.
+constexpr int32_t kListMargin = 16;
+constexpr int32_t kListLeft = kFullBleedLeft + kListMargin;
+constexpr uint32_t kListWidth =
+    static_cast<uint32_t>(kFullBleedRight - kListMargin - kListLeft);
+// How far the description is allowed to shrink when even that span is not
+// enough; below this it stops being readable and is better left clipped.
+constexpr float kMinDescriptionScale = 0.44f;
 // Rows sit a couple of pixels below their icon so the text baseline lines up.
 constexpr uint32_t kTextYBias = 4;
 
@@ -749,11 +771,93 @@ void BuildList(PPCContext& ctx, uint8_t* base, uint32_t screen) {
     }
     row.name = CreateText(ctx, base, screen, kNameX, y + kTextYBias, kNameScale);
     row.description =
-        CreateText(ctx, base, screen, kDescriptionX, y + kTextYBias, kDescriptionScale);
+        CreateText(ctx, base, screen, kInitialDescriptionX, y + kTextYBias, kDescriptionScale);
   }
 
   CreateBackPrompt(ctx, base, screen);
   REXLOG_INFO("[achievements_screen] built {} achievement rows", g_row_count);
+}
+
+// Lays the three columns out and centres them as one block.
+//
+// The description column goes a few pixels past the end of the longest name;
+// the block as a whole -- icon, name column, description column -- is then
+// centred in the safe area. Must run after the text has been set, since both
+// widths are measured off the widgets rather than guessed from the character
+// count: the font is proportional and everything on the row is localized, so a
+// fixed layout that reads well in English overlaps in German, and a
+// left-anchored one leaves Japanese stranded against the left edge.
+void AlignRowColumns(PPCContext& ctx, uint8_t* base) {
+  if (!g_text_width_fn) {
+    return;
+  }
+  uint32_t widest_name = 0;
+  uint32_t widest_description = 0;
+  for (uint32_t i = 0; i < g_row_count; ++i) {
+    if (g_rows[i].name) {
+      widest_name = std::max(widest_name, CallGuest(ctx, base, g_text_width_fn, g_rows[i].name));
+    }
+    if (g_rows[i].description) {
+      widest_description =
+          std::max(widest_description, CallGuest(ctx, base, g_text_width_fn, g_rows[i].description));
+    }
+  }
+
+  // The list is centred in the full-bleed span, not the 640-wide safe area: the
+  // backing panel already spans -106..746, and both spans share the same centre
+  // (320), so this stays lined up with the heading while giving a long language
+  // the room either side that the safe area alone does not have. French
+  // descriptions overshot the right edge under safe-area-only centring purely
+  // because that left the space out here unused.
+  const uint32_t fixed_width = kIconSize + kIconGap + widest_name + kDescriptionGap;
+
+  // Only if the row still does not fit does the description shrink, and only
+  // the description -- the names stay at a consistent size across languages.
+  // The scale is reset every refresh, so a language that fits is never left
+  // wearing the previous one's shrink.
+  float description_scale = kDescriptionScale;
+  if (fixed_width + widest_description > kListWidth) {
+    const uint32_t room = (fixed_width < kListWidth) ? kListWidth - fixed_width : 0;
+    if (widest_description) {
+      description_scale = std::max(kMinDescriptionScale,
+                                   kDescriptionScale * static_cast<float>(room) /
+                                       static_cast<float>(widest_description));
+    }
+  }
+  widest_description = 0;
+  for (uint32_t i = 0; i < g_row_count; ++i) {
+    if (g_rows[i].description) {
+      CallGuestFloat(ctx, base, g_text_set_scale_fn, g_rows[i].description, description_scale);
+      widest_description =
+          std::max(widest_description, CallGuest(ctx, base, g_text_width_fn, g_rows[i].description));
+    }
+  }
+
+  const uint32_t block_width = fixed_width + widest_description;
+  // Anything still too wide starts at the left edge of the list span rather
+  // than overhanging both sides at once.
+  const int32_t icon_x =
+      kListLeft + ((block_width < kListWidth) ? static_cast<int32_t>((kListWidth - block_width) / 2)
+                                              : 0);
+  const uint32_t name_x = static_cast<uint32_t>(icon_x + static_cast<int32_t>(kIconSize + kIconGap));
+  const uint32_t description_x = name_x + widest_name + kDescriptionGap;
+
+  for (uint32_t i = 0; i < g_row_count; ++i) {
+    const RowWidgets& row = g_rows[i];
+    const uint32_t y = kFirstRowY + i * kRowSpacing;
+    if (row.icon) {
+      // An image widget's position lives in its rect, so it moves through the
+      // rect setter rather than the +4/+8 a text widget takes.
+      CallGuest(ctx, base, g_image_set_rect_fn, row.icon, static_cast<uint32_t>(icon_x), y,
+                static_cast<uint32_t>(icon_x + static_cast<int32_t>(kIconSize)), y + kIconSize);
+    }
+    if (row.name) {
+      rex::memory::store_and_swap<uint32_t>(base + row.name + kWidgetXOffset, name_x);
+    }
+    if (row.description) {
+      rex::memory::store_and_swap<uint32_t>(base + row.description + kWidgetXOffset, description_x);
+    }
+  }
 }
 
 // Refreshes every row's text and locked/unlocked styling. Runs on each open, so
@@ -790,6 +894,11 @@ void RefreshList(PPCContext& ctx, uint8_t* base) {
     CallGuest(ctx, base, g_text_set_colour_fn, row.name, text_colour);
     CallGuest(ctx, base, g_text_set_colour_fn, row.description, text_colour);
   }
+
+  // Text can change between opens (a mod registering a translation, or an
+  // unlock swapping in a longer blurb), so the columns are re-measured here
+  // rather than fixed once at build time.
+  AlignRowColumns(ctx, base);
 }
 
 // Leaves the screen, back to wherever we came from, and disarms the pre-game
