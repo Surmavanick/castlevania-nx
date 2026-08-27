@@ -34,6 +34,7 @@
 #include "achievements_menu.h"
 #include "achievements_screen.h"
 #include "fast_forward.h"
+#include "font_overlay.h"
 #include "frame_pacer.h"
 #include "fonts.generated.h"
 #include "graphics_settings.h"
@@ -227,6 +228,14 @@ class NocturnerecompApp : public rex::ReXApp {
     // achievements_screen.h). Must come after NativeOptions::Bind: it leans on
     // that file's pre-game watchdog suppression, which is only installed there.
     nocturne::GetAchievementsScreen().Bind(runtime());
+
+    // Drawing the achievements in-game means drawing them with the title's own
+    // font, and font_ja.xpr is a subset built only from strings_ja.bin -- it
+    // has no glyph for 33 of the characters the Japanese achievement text
+    // uses. Compose the player's font with our own supplemental glyph art in
+    // memory (see font_overlay.h); their file is never modified. Runs before
+    // the guest starts, so it is in place by the title's first font load.
+    nocturne::InstallJapaneseFontOverlay(runtime());
 
     // Steady internal-framerate pacer: drives the game's target_time clock at
     // exactly real-time from a dedicated steady-clock thread, so the PS1

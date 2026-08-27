@@ -55,6 +55,29 @@ add_custom_command(
     VERBATIM
 )
 
+# Supplemental Japanese glyphs: font_ja.xpr is a subset font missing 33 of the
+# characters the achievement strings use, and it is the player's own extracted
+# copyrighted asset, so we ship our own art for the 27 that need it (the other
+# 6 are fullwidth forms aliased onto stock ASCII glyphs) and compose the two in
+# memory at load time (see src/font_patch.cpp). The PNGs in
+# src/fonts/glyphs_ja/ are the checked-in source of truth;
+# src/glyph_pack.generated.h is a gitignored build artifact.
+set(NOCTURNE_GLYPHS_HEADER ${CMAKE_SOURCE_DIR}/src/glyph_pack.generated.h)
+# CONFIGURE_DEPENDS so dropping a newly drawn glyph into the folder (or taking
+# one out) re-runs the generator on the next build instead of needing a manual
+# CMake reconfigure.
+file(GLOB NOCTURNE_GLYPH_ART CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/fonts/glyphs_ja/*.png)
+add_custom_command(
+    OUTPUT ${NOCTURNE_GLYPHS_HEADER}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen-glyphs.py
+    DEPENDS
+        ${CMAKE_SOURCE_DIR}/scripts/gen-glyphs.py
+        ${CMAKE_SOURCE_DIR}/src/fonts/glyphs_ja/metrics.toml
+        ${NOCTURNE_GLYPH_ART}
+    COMMENT "Generating src/glyph_pack.generated.h"
+    VERBATIM
+)
+
 # Embedded window icon: extracted directly from assets/default.xex (already a
 # required codegen input) so no extra asset needs to be checked in or fetched.
 # src/icon.generated.h is a gitignored build artifact regenerated whenever the
@@ -100,6 +123,8 @@ set(NOCTURNERECOMP_SOURCES
     src/achievements_menu.cpp
     src/achievements_screen.cpp
     src/fast_forward.cpp
+    src/font_overlay.cpp
+    src/font_patch.cpp
     src/frame_pacer.cpp
     src/graphics_settings.cpp
     src/headless_gpu_bridge.cpp
@@ -112,6 +137,7 @@ set(NOCTURNERECOMP_SOURCES
     src/settings.cpp
     src/xbox_live.cpp
     ${NOCTURNE_FONTS_HEADER}
+    ${NOCTURNE_GLYPHS_HEADER}
     ${NOCTURNE_ICON_HEADER}
     ${GENERATED_SOURCES}
 )
