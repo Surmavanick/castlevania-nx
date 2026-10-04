@@ -73,6 +73,47 @@ bool RangeReadable(rex::memory::Memory* memory, uint32_t address, uint32_t size)
 
 }  // namespace
 
+bool TryReadGameTime(rex::Runtime* runtime, int32_t* game_time_out) {
+  if (!runtime || !game_time_out) {
+    return false;
+  }
+
+  auto* memory = runtime->memory();
+  auto* mod_registry = runtime->mod_registry();
+  if (!memory || !mod_registry) {
+    return false;
+  }
+
+  // The symbol address is stable for the process. Resolve it independently of
+  // FramePacer::ThreadMain because that thread deliberately skips all guest
+  // memory work while frame_pacer_enabled is false (the normal configuration).
+  static std::atomic<uint32_t> singleton_ptr_addr{0};
+  uint32_t singleton_addr = singleton_ptr_addr.load(std::memory_order_acquire);
+  if (!singleton_addr) {
+    auto resolved = mod_registry->FindAddress("app.singleton_ptr");
+    if (!resolved) {
+      return false;
+    }
+    singleton_addr = *resolved;
+    singleton_ptr_addr.store(singleton_addr, std::memory_order_release);
+  }
+
+  if (!RangeReadable(memory, singleton_addr, 4)) {
+    return false;
+  }
+  uint32_t app_base = static_cast<uint32_t>(ReadGuestI32BE(memory, singleton_addr));
+  if (!app_base || !RangeReadable(memory, app_base + kGameTimeOffset, sizeof(uint32_t))) {
+    return false;
+  }
+
+  int32_t game_time = ReadGuestI32BE(memory, app_base + kGameTimeOffset);
+  if (std::abs(int64_t(game_time)) > kMaxPlausibleTimeValue) {
+    return false;
+  }
+  *game_time_out = game_time;
+  return true;
+}
+
 FramePacer::~FramePacer() { Stop(); }
 
 void FramePacer::Bind(rex::Runtime* runtime) {

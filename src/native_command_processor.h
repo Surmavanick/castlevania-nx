@@ -306,6 +306,12 @@ class NativeCommandProcessor {
     // choice stays scoped to this one texture rather than applying to every
     // sampler slot in a draw.
     bool is_gameplay_preview = false;
+    // Raw, unfiltered gameplay-preview images have stable dimensions and a
+    // stable fetch key while the guest replaces their contents in place.
+    // Preserve this allocation across coherency invalidations and overwrite
+    // it from the current frame's staging arena.
+    bool reusable_gameplay_preview = false;
+    bool dirty = false;
   };
   UploadedTexture* GetOrUploadTexture(uint32_t fetch_constant_index);
 
@@ -316,8 +322,17 @@ class NativeCommandProcessor {
   // Synchronous (waits for completion before returning) -- texture uploads
   // are rare relative to per-frame draw traffic, so simplicity here matters
   // more than overlapping this with other GPU work.
-  bool UploadTexelsAndTransition(VkImage image, uint32_t width, uint32_t height,
-                                 const void* rgba_data);
+  bool UploadTexelsAndTransition(
+      VkImage image, uint32_t width, uint32_t height, const void* rgba_data,
+      VkImageLayout old_layout = VK_IMAGE_LAYOUT_UNDEFINED);
+
+  // Queues an RGBA8 upload in the active frame's persistently mapped staging
+  // arena. FlushPendingSharedMemoryCopies records the image barriers/copy in
+  // command_buffer_ before the draw that samples it, avoiding a separate
+  // queue submit and fence wait. Returns false when the arena can't be used,
+  // allowing the synchronous helper above to remain the safe fallback.
+  bool QueueTextureUpload(VkImage image, uint32_t width, uint32_t height,
+                          const void* rgba_data, VkImageLayout old_layout);
 
   // Reuses the SDK's own post_process_shader_path/post_process_shader_enabled
   // cvars, but runs the configured shader only over the gameplay-preview texture
@@ -361,7 +376,7 @@ class NativeCommandProcessor {
 
   // Begins accumulating a frame's draws into color_target_image_ if this is
   // the first draw since the last present (render pass begin + clear).
-  void EnsureFrameBegun();
+  bool EnsureFrameBegun();
 
   void UpdateSharedMemory(uint32_t guest_address_dwords, uint32_t size_dwords);
 
@@ -426,6 +441,7 @@ class NativeCommandProcessor {
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence submit_fence_ = VK_NULL_HANDLE;
+  bool submit_fence_pending_ = false;
 
   // Milestone 3b step 3 pipeline resources.
   bool pipeline_resources_valid_ = false;
@@ -484,6 +500,28 @@ class NativeCommandProcessor {
   bool texture_cache_limit_logged_ = false;
   std::unordered_map<uint64_t, UploadedTexture> texture_cache_;
   void DestroyTextureCache();
+
+  // Switch performance experiment: the XBLA shell's animated outer cloud
+  // strip is intentionally omitted. The candidate is first narrowed by its
+  // complete fetch metadata and then verified once by a content hash (see
+  // TryDraw), so another 852x128 texture can't be skipped just because its
+  // dimensions happen to match. These members are inert on every non-Switch
+  // build; keeping them unconditional avoids leaking platform macros into
+  // this otherwise portable header.
+  uint32_t switch_cloud_texture_base_address_ = 0;
+  std::unordered_set<uint32_t> switch_rejected_cloud_texture_bases_;
+  uint64_t switch_cloud_draws_skipped_ = 0;
+
+  // Previous PM4_XE_SWAP payload and state for the Switch-only guarded
+  // redundant-frontbuffer-resolve experiment. See OnPacket/TryResolveCopy.
+  uint32_t last_swap_frontbuffer_address_ = 0;
+  uint32_t last_swap_frontbuffer_width_ = 0;
+  uint32_t last_swap_frontbuffer_height_ = 0;
+  uint32_t switch_last_skipped_frontbuffer_address_ = 0;
+  uint32_t switch_last_skipped_frontbuffer_size_ = 0;
+  uint64_t switch_frontbuffer_resolves_skipped_ = 0;
+  bool switch_frontbuffer_resolve_skip_disabled_ = false;
+  bool switch_frontbuffer_resolve_overlap_logged_ = false;
 
   // See InitializeTextureReplacement. Null until that's called (or if it's
   // never called, e.g. a standalone debug build) -- GetOrUploadTexture treats
@@ -555,6 +593,14 @@ class NativeCommandProcessor {
   uint8_t* shared_memory_staging_mapped_ = nullptr;
   VkDeviceSize shared_memory_staging_offset_ = 0;
   std::vector<VkBufferCopy> pending_shared_copies_;
+  struct PendingTextureUpload {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceSize staging_offset = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkImageLayout old_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  };
+  std::vector<PendingTextureUpload> pending_texture_uploads_;
 
   // Matches the guest's actual configured video mode (video_mode_width/
   // height, or window_width/height, or a --resolution preset -- see

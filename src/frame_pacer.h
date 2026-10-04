@@ -57,4 +57,10 @@ class FramePacer {
 // Process-wide instance shared between the app hooks.
 FramePacer& GetFramePacer();
 
+// Reads the game's fixed-step simulation clock (300 units per second) using
+// the same guarded singleton walk as the optional pacer. This is read-only and
+// remains available while the pacer itself is disabled, so the Switch profiler
+// can distinguish simulation updates from rendered presents.
+bool TryReadGameTime(rex::Runtime* runtime, int32_t* game_time_out);
+
 }  // namespace nocturne

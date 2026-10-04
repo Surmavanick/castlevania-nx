@@ -109,8 +109,8 @@ each step verified against a real capture or live run, not just code review.
 python scripts/build.py
 python ./nocturnerecomp.exe
 
-# Debug build with real guest+SDK symbols (see CLAUDE.md for the DLL-naming
-# workaround this currently requires)
+# Debug build with real guest+SDK symbols. If the deployed SDK DLL has a
+# release-only name, deploy the RelWithDebInfo SDK first as shown below.
 cd ../rexglue-sdk && python scripts/deploy-sdk.py --config RelWithDebInfo --project NocturneRecomp
 cd ../NocturneRecomp && python scripts/build.py --debug
 

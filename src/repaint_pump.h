@@ -8,6 +8,7 @@
 #include <thread>
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/ui_drawer.h>
 
@@ -19,7 +20,13 @@
 // past the display's actual refresh rate (observed: ~800fps on a Linux/
 // Wayland setup with no compositor-side throttling, vs. Windows/DWM which
 // happens to throttle mailbox close to refresh on its own).
-REXCVAR_DEFINE_INT32(max_host_fps, 120, "Video", "Cap host present rate (0 = uncapped)");
+#if REX_PLATFORM_SWITCH
+constexpr int32_t kDefaultMaxHostFps = 60;
+#else
+constexpr int32_t kDefaultMaxHostFps = 120;
+#endif
+REXCVAR_DEFINE_INT32(max_host_fps, kDefaultMaxHostFps, "Video",
+                    "Cap host present rate (0 = uncapped)");
 
 namespace nocturne {
 

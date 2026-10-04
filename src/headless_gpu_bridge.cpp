@@ -10,11 +10,17 @@
 
 #include <xxhash.h>
 
+#include <rex/chrono/clock.h>
 #include <rex/graphics/register_file.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/platform.h>
 #include <rex/system/xvideo.h>
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+#endif
 
 namespace nocturne {
 
@@ -23,6 +29,40 @@ using rex::graphics::PacketCategory;
 using rex::graphics::PacketDisassembler;
 using rex::graphics::PacketInfo;
 using rex::graphics::RegisterFile;
+
+namespace {
+
+constexpr unsigned kPerfRingDecodeCalls = 97;
+constexpr unsigned kPerfRingDecodeTicks = 98;
+constexpr unsigned kPerfGuestIsrTicks = 101;
+
+class SwitchPerfScope {
+ public:
+  explicit SwitchPerfScope(unsigned id) : id_(id) {
+#if REX_PLATFORM_SWITCH
+    start_ = rex::chrono::Clock::QueryHostTickCount();
+#endif
+  }
+
+  ~SwitchPerfScope() {
+#if REX_PLATFORM_SWITCH
+    RexSwitchPerfAdd(id_, rex::chrono::Clock::QueryHostTickCount() - start_);
+#endif
+  }
+
+ private:
+  unsigned id_;
+#if REX_PLATFORM_SWITCH
+  uint64_t start_ = 0;
+#endif
+};
+
+void DispatchGraphicsInterruptProfiled(uint32_t source, uint32_t cpu) {
+  SwitchPerfScope timer(kPerfGuestIsrTicks);
+  rex::system::kernel_state()->DispatchGraphicsInterruptCallback(source, cpu);
+}
+
+}  // namespace
 
 HeadlessGpuBridge::HeadlessGpuBridge(PacketCallback packet_callback)
     : packet_callback_(std::move(packet_callback)) {}
@@ -43,6 +83,13 @@ rex::system::KernelState::HeadlessGpuHooks HeadlessGpuBridge::BuildHooks() {
 void HeadlessGpuBridge::OnRingBufferInit(uint32_t ptr, uint32_t size_log2) {
   ring_buffer_base_.store(ptr, std::memory_order_release);
   ring_buffer_size_log2_.store(size_log2, std::memory_order_release);
+  // Match CommandProcessor::InitializeRingBuffer: a newly initialized ring
+  // starts with its consumer at dword zero. This also prevents a cursor from
+  // an older, larger ring from underflowing the bulk-copy split below.
+  ring_buffer_decode_pos_.store(0, std::memory_order_release);
+  uint32_t size_bytes = 1u << (size_log2 + 3);
+  REXGPU_INFO("headless GPU ring buffer: base={:08X}, size_log2={}, size={} KiB", ptr,
+              size_log2, size_bytes >> 10);
 }
 
 void HeadlessGpuBridge::OnRPtrWriteBackEnabled(uint32_t ptr, uint32_t /*block_size_log2*/) {
@@ -51,28 +98,117 @@ void HeadlessGpuBridge::OnRPtrWriteBackEnabled(uint32_t ptr, uint32_t /*block_si
 
 uint32_t HeadlessGpuBridge::OnMmioRead(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+  uint32_t value = 0;
+  bool used_register_mirror = false;
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
-      return 0x08100748;
+      value = 0x08100748;
+      break;
     case 0x0F01:  // RB_BC_CONTROL
-      return 0x0000200E;
+      value = 0x0000200E;
+      break;
     case 0x194C: {  // R500_D1MODE_V_COUNTER
       rex::system::X_VIDEO_MODE video_mode;
       rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-      return std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+      value = std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
+      break;
     }
     case 0x1951:    // interrupt status
-      return 1;     // vblank
+      value = 1;    // vblank
+      break;
     case 0x1961: {  // AVIVO_D1MODE_VIEWPORT_SIZE
       rex::system::X_VIDEO_MODE video_mode;
       rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
       uint32_t viewport_width = std::min(uint32_t(video_mode.display_width), uint32_t(0x0FFF));
       uint32_t viewport_height = std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
-      return (viewport_width << 16) | viewport_height;
+      value = (viewport_width << 16) | viewport_height;
+      break;
     }
-    default:
-      return 0;
+    default: {
+      used_register_mirror = true;
+      if (r < register_values_.size()) {
+        value = register_values_[r].load(std::memory_order_relaxed);
+      }
+      break;
+    }
   }
+
+  RecordMmioRead(r, value, used_register_mirror);
+  return value;
+}
+
+void HeadlessGpuBridge::MirrorRegisterWrite(uint32_t index, uint32_t value) {
+  if (index < register_values_.size()) {
+    register_values_[index].store(value, std::memory_order_relaxed);
+  }
+}
+
+void HeadlessGpuBridge::RecordMmioRead(uint32_t index, uint32_t value,
+                                       bool used_register_mirror) {
+  if (index >= mmio_read_counts_.size()) {
+    return;
+  }
+
+  uint64_t previous = mmio_read_counts_[index].fetch_add(1, std::memory_order_relaxed);
+  uint64_t total = mmio_read_total_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // Report only the first encounter with a default-handled register, and cap
+  // startup noise globally. Even if the cap is reached, the periodic top-N
+  // histogram below will still expose a hot register.
+  if (used_register_mirror && previous == 0) {
+    uint32_t log_index = first_default_read_logs_.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 32) {
+      const auto* info = RegisterFile::GetRegisterInfo(index);
+      REXGPU_WARN("headless GPU MMIO: first default read {:04X} ({}) -> {:08X}", index,
+                  info ? info->name : "<unknown>", value);
+    } else if (log_index == 32) {
+      REXGPU_WARN(
+          "headless GPU MMIO: suppressing further first-default-read messages; "
+          "periodic histogram remains active");
+    }
+  }
+
+  constexpr uint64_t kHistogramInterval = uint64_t{1} << 20;
+  if ((total & (kHistogramInterval - 1)) != 0 ||
+      mmio_histogram_report_in_progress_.test_and_set(std::memory_order_acquire)) {
+    return;
+  }
+
+  struct HotRegister {
+    uint64_t count = 0;
+    uint32_t index = 0;
+  };
+  std::array<HotRegister, 6> hottest{};
+  for (uint32_t candidate_index = 0; candidate_index < mmio_read_counts_.size();
+       ++candidate_index) {
+    HotRegister candidate{
+        mmio_read_counts_[candidate_index].load(std::memory_order_relaxed), candidate_index};
+    if (!candidate.count || candidate.count <= hottest.back().count) {
+      continue;
+    }
+    for (size_t hot_index = 0; hot_index < hottest.size(); ++hot_index) {
+      if (candidate.count > hottest[hot_index].count) {
+        for (size_t move_index = hottest.size() - 1; move_index > hot_index; --move_index) {
+          hottest[move_index] = hottest[move_index - 1];
+        }
+        hottest[hot_index] = candidate;
+        break;
+      }
+    }
+  }
+
+  REXGPU_WARN("headless GPU MMIO histogram after {} reads (cumulative top {})", total,
+              hottest.size());
+  for (const HotRegister& hot : hottest) {
+    if (!hot.count) {
+      break;
+    }
+    const auto* info = RegisterFile::GetRegisterInfo(hot.index);
+    uint32_t mirrored_value = register_values_[hot.index].load(std::memory_order_relaxed);
+    REXGPU_WARN("  {:04X} ({}) reads={} mirrored={:08X}", hot.index,
+                info ? info->name : "<unknown>", hot.count, mirrored_value);
+  }
+  mmio_histogram_report_in_progress_.clear(std::memory_order_release);
 }
 
 void HeadlessGpuBridge::ApplyScratchRegisterWrite(uint32_t index, uint32_t value) {
@@ -136,7 +272,7 @@ void HeadlessGpuBridge::DispatchStreamCpuInterrupt(uint32_t cpu_mask) {
   if (StreamCpuInterruptSlotArmed()) {
     for (uint32_t n = 0; n < 6; n++) {
       if (cpu_mask & (1u << n)) {
-        rex::system::kernel_state()->DispatchGraphicsInterruptCallback(1, n);
+        DispatchGraphicsInterruptProfiled(1, n);
       }
     }
     return;
@@ -169,12 +305,33 @@ bool PacketActionsPlausible(const PacketInfo& info) {
   }
   return true;
 }
+
+uint32_t DeclaredPacketDwordCount(uint32_t packet) {
+  // PacketDisassembler treats these raw filler values as one dword even
+  // though their top bits otherwise resemble ordinary packet headers.
+  if (packet == 0 || packet == 0x0BADF00D) {
+    return 1;
+  }
+  switch (packet >> 30) {
+    case 0:
+      return 2 + ((packet >> 16) & 0x3FFF);
+    case 1:
+      return 3;
+    case 2:
+      return 1;
+    case 3:
+      return 2 + ((packet >> 16) & 0x3FFF);
+    default:
+      return 1;
+  }
+}
 }  // namespace
 
 void HeadlessGpuBridge::ForwardPacket(const PacketInfo& info, const uint8_t* packet_base,
                                       bool duplicate_ib_content) {
   for (const auto& action : info.actions) {
     if (action.type == PacketAction::Type::kRegisterWrite) {
+      MirrorRegisterWrite(action.register_write.index, action.register_write.value);
       ApplyScratchRegisterWrite(action.register_write.index, action.register_write.value);
     }
   }
@@ -192,6 +349,7 @@ void HeadlessGpuBridge::ForwardPacket(const PacketInfo& info, const uint8_t* pac
 
 void HeadlessGpuBridge::OnMmioWrite(uint32_t addr, uint32_t value) {
   uint32_t r = (addr & 0xFFFF) / 4;
+  MirrorRegisterWrite(r, value);
   ApplyScratchRegisterWrite(r, value);
 
   if (r == 0x01C5) {  // CP_RB_WPTR
@@ -208,13 +366,18 @@ void HeadlessGpuBridge::OnMmioWrite(uint32_t addr, uint32_t value) {
     uint32_t mask = pending_cpu_interrupt_mask_.load(std::memory_order_acquire);
     for (uint32_t n = 0; n < 6; n++) {
       if (mask & (1u << n)) {
-        rex::system::kernel_state()->DispatchGraphicsInterruptCallback(1, n);
+        DispatchGraphicsInterruptProfiled(1, n);
       }
     }
   }
 }
 
 void HeadlessGpuBridge::DecodeRingBuffer(uint32_t new_wptr) {
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfAdd(kPerfRingDecodeCalls, 1);
+#endif
+  SwitchPerfScope decode_timer(kPerfRingDecodeTicks);
+
   // No real GPU drains the ring buffer, so make it look infinitely fast:
   // immediately mirror the just-submitted write pointer back into the
   // read-pointer write-back address -- this is what unblocks guest code
@@ -224,6 +387,10 @@ void HeadlessGpuBridge::DecodeRingBuffer(uint32_t new_wptr) {
     rex::memory::store_and_swap<uint32_t>(rex::system::kernel_memory()->TranslatePhysical(writeback_ptr),
                                           new_wptr);
   }
+  // CP_RB_RPTR is the direct-register view of the same consumed position.
+  // Since headless submission is synchronous and the write-back above already
+  // promises full consumption, keep both hardware-visible views consistent.
+  MirrorRegisterWrite(0x01C4, new_wptr);
 
   uint32_t base = ring_buffer_base_.load(std::memory_order_acquire);
   if (!base) {
@@ -237,22 +404,37 @@ void HeadlessGpuBridge::DecodeRingBuffer(uint32_t new_wptr) {
 
   // Decode from the persistent decode cursor, not from the wptr seen on the
   // previous call: packets routinely span multiple CP_RB_WPTR writes.
-  uint32_t decode_pos = ring_buffer_decode_pos_.load(std::memory_order_acquire);
+  uint32_t decode_pos =
+      ring_buffer_decode_pos_.load(std::memory_order_acquire) & (size_dwords - 1);
   uint32_t available = (new_wptr - decode_pos) & (size_dwords - 1);
   if (!available) {
     return;
   }
 
-  // Copy the entire ring (wrapped, starting at decode_pos), padded past one
-  // full lap by the largest possible packet body, into a flat local buffer
-  // so a speculative packet-body read never goes out of bounds.
-  constexpr uint32_t kMaxPacketDwords = 1 + (0x3FFF + 1);
-  std::vector<uint32_t> raw(size_dwords + kMaxPacketDwords);
+  // Copy only the newly submitted window, unwrapping it into a flat buffer.
+  // The old path copied the entire primary ring plus padding on every
+  // CP_RB_WPTR write even though decoding stops at `available`; on Switch,
+  // that redundant walk ran several times per guest frame on the serialized
+  // main XThread. Keep zero padding for PacketDisassembler's speculative
+  // packet-body reads: an incomplete tail is retained by leaving the decode
+  // cursor before it and will be decoded with real bytes on a later write.
+  // Keep this buffer invocation-local because forwarding a PM4 interrupt may
+  // synchronously enter guest code and submit another write before the outer
+  // decode returns. The disassembler's widest fixed look-ahead is six body
+  // dwords; variable-length reads are protected by the declared-size check
+  // below.
+  constexpr uint32_t kDisassemblerReadAheadDwords = 6;
+  std::vector<uint32_t> raw(size_t(available) + kDisassemblerReadAheadDwords);
   auto* memory = rex::system::kernel_memory();
-  for (uint32_t i = 0; i < raw.size(); ++i) {
-    uint32_t ring_index = (decode_pos + i) & (size_dwords - 1);
-    std::memcpy(&raw[i], memory->TranslatePhysical(base + ring_index * 4), sizeof(uint32_t));
+  uint32_t first_dwords = std::min(available, size_dwords - decode_pos);
+  std::memcpy(raw.data(), memory->TranslatePhysical(base + decode_pos * 4),
+              size_t(first_dwords) * sizeof(uint32_t));
+  uint32_t second_dwords = available - first_dwords;
+  if (second_dwords) {
+    std::memcpy(raw.data() + first_dwords, memory->TranslatePhysical(base),
+                size_t(second_dwords) * sizeof(uint32_t));
   }
+  std::fill(raw.begin() + available, raw.end(), 0u);
 
   const uint8_t* buf = reinterpret_cast<const uint8_t*>(raw.data());
   uint32_t offset_dwords = 0;
@@ -263,14 +445,20 @@ void HeadlessGpuBridge::DecodeRingBuffer(uint32_t new_wptr) {
   std::unordered_set<uint64_t> decoded_ib_content_hashes_this_call;
 
   while (offset_dwords < available) {
-    PacketInfo info;
+    uint32_t packet = rex::memory::load_and_swap<uint32_t>(buf + offset_dwords * 4);
+    uint32_t declared_packet_dwords = DeclaredPacketDwordCount(packet);
+    if (declared_packet_dwords > available - offset_dwords) {
+      break;
+    }
+
+    PacketInfo info{};
     if (!PacketDisassembler::DisasmPacket(buf + offset_dwords * 4, &info, memory)) {
       REXGPU_DEBUG("headless pm4: [{}] <unrecognized packet, aborting decode>",
                    decode_pos + offset_dwords);
       break;
     }
     uint32_t packet_dwords = info.count;
-    if (offset_dwords + packet_dwords > available) {
+    if (packet_dwords != declared_packet_dwords || packet_dwords > available - offset_dwords) {
       break;
     }
     if (!PacketActionsPlausible(info)) {

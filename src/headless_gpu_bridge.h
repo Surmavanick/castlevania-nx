@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <rex/graphics/packet_disassembler.h>
+#include <rex/graphics/register_file.h>
 #include <rex/system/kernel_state.h>
 
 namespace nocturne {
@@ -49,6 +51,8 @@ class HeadlessGpuBridge {
   void OnMmioWrite(uint32_t addr, uint32_t value);
   uint32_t OnMmioRead(uint32_t addr);
 
+  void MirrorRegisterWrite(uint32_t index, uint32_t value);
+  void RecordMmioRead(uint32_t index, uint32_t value, bool used_register_mirror);
   void ApplyScratchRegisterWrite(uint32_t index, uint32_t value);
   bool StreamCpuInterruptSlotArmed();
   void DispatchStreamCpuInterrupt(uint32_t cpu_mask);
@@ -57,6 +61,24 @@ class HeadlessGpuBridge {
                      bool duplicate_ib_content);
 
   PacketCallback packet_callback_;
+
+  // GraphicsSystem uses one shared RegisterFile for CPU MMIO writes and PM4
+  // register writes, and returns that file for all non-special MMIO reads.
+  // Headless mode has no GraphicsSystem, so retain the same state here. The
+  // entries are atomic because MMIO faults and packet submission are not
+  // required to arrive on the same host thread.
+  std::array<std::atomic<uint32_t>, rex::graphics::RegisterFile::kRegisterCount>
+      register_values_{};
+
+  // MMIO diagnostics are deliberately fixed-size and allocation-free. A
+  // read only pays two relaxed atomic increments; a bounded top-register
+  // scan happens once per 2^20 reads. This is enough to identify a tight
+  // status-register polling loop without emitting a log line per fault.
+  static constexpr size_t kMmioRegisterCount = 0x4000;
+  std::array<std::atomic<uint64_t>, kMmioRegisterCount> mmio_read_counts_{};
+  std::atomic<uint64_t> mmio_read_total_{0};
+  std::atomic<uint32_t> first_default_read_logs_{0};
+  std::atomic_flag mmio_histogram_report_in_progress_ = ATOMIC_FLAG_INIT;
 
   std::atomic<uint32_t> ring_buffer_rptr_writeback_ptr_{0};
   std::atomic<uint32_t> ring_buffer_base_{0};

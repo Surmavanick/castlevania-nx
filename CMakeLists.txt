@@ -10,7 +10,28 @@ project(nocturnerecomp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(generated/rexglue.cmake)
+if(REXGLUE_PLATFORM_SWITCH)
+    # Nintendo Switch: the SDK is built from source (Horizon layer) and the
+    # generated code comes from a host-side codegen run; see cmake/switch.cmake.
+    enable_language(C)
+    set(REXSDK_DIR "" CACHE PATH "ReXGlue SDK source tree with the Horizon layer")
+    if(NOT EXISTS "${REXSDK_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "Set REXSDK_DIR to the ReXGlue SDK source tree with the Horizon layer")
+    endif()
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/sources.cmake" OR
+       NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/nocturnerecomp_init.h")
+        message(FATAL_ERROR
+            "NocturneRecomp generated sources are missing. Run host-side rexglue codegen "
+            "before configuring the Switch build.")
+    endif()
+    add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
+    include(generated/sources.cmake)
+    if(NOT GENERATED_SOURCES)
+        message(FATAL_ERROR "generated/sources.cmake did not list translation units")
+    endif()
+else()
+    include(generated/rexglue.cmake)
+endif()
 
 # Project version: the nearest reachable `vX.Y.Z` git tag, not an exact
 # match -- a dev build sitting on commits after v1.2.2 already contains
@@ -78,21 +99,23 @@ add_custom_command(
     VERBATIM
 )
 
-# Embedded window icon: extracted directly from assets/default.xex (already a
-# required codegen input) so no extra asset needs to be checked in or fetched.
-# src/icon.generated.h is a gitignored build artifact regenerated whenever the
-# XEX or the generator script changes.
-set(NOCTURNE_ICON_HEADER ${CMAKE_SOURCE_DIR}/src/icon.generated.h)
-set(NOCTURNE_ICON_ICO ${CMAKE_SOURCE_DIR}/src/icon.generated.ico)
-add_custom_command(
-    OUTPUT ${NOCTURNE_ICON_HEADER} ${NOCTURNE_ICON_ICO}
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen-icon.py
-    DEPENDS
-        ${CMAKE_SOURCE_DIR}/scripts/gen-icon.py
-        ${CMAKE_SOURCE_DIR}/assets/default.xex
-    COMMENT "Generating src/icon.generated.h and src/icon.generated.ico"
-    VERBATIM
-)
+# Desktop builds use the title icon extracted from the user's own XEX. Do not
+# link that copyrighted image into the redistributable Switch NRO; Horizon uses
+# the original, project-owned icon supplied to nacptool in cmake/switch.cmake.
+set(NOCTURNE_ICON_HEADER "")
+if(NOT REXGLUE_PLATFORM_SWITCH)
+    set(NOCTURNE_ICON_HEADER ${CMAKE_SOURCE_DIR}/src/icon.generated.h)
+    set(NOCTURNE_ICON_ICO ${CMAKE_SOURCE_DIR}/src/icon.generated.ico)
+    add_custom_command(
+        OUTPUT ${NOCTURNE_ICON_HEADER} ${NOCTURNE_ICON_ICO}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen-icon.py
+        DEPENDS
+            ${CMAKE_SOURCE_DIR}/scripts/gen-icon.py
+            ${CMAKE_SOURCE_DIR}/assets/default.xex
+        COMMENT "Generating src/icon.generated.h and src/icon.generated.ico"
+        VERBATIM
+    )
+endif()
 
 # On Windows, also embed the same icon as the .exe's own resource (Explorer,
 # taskbar before the window opens, Alt-Tab), separate from the in-window icon
@@ -141,6 +164,11 @@ set(NOCTURNERECOMP_SOURCES
     ${NOCTURNE_ICON_HEADER}
     ${GENERATED_SOURCES}
 )
+
+if(REXGLUE_PLATFORM_SWITCH)
+    include(cmake/switch.cmake)
+    return()
+endif()
 
 if(WIN32)
     add_executable(nocturnerecomp WIN32 ${NOCTURNERECOMP_SOURCES} ${NOCTURNE_ICON_RC})

@@ -5,6 +5,11 @@ NocturneRecomp.code-workspace
 
 # Build output
 /out/
+/build-switch/
+/dist/
+*.nro
+*.nacp
+*.elf
 *.pdb
 *.ilk
 *.exp
@@ -45,6 +50,7 @@ nocturnerecomp
 nocturnerecomp.exe
 nocturnerecomp.pdb
 nocturnerecomp.toml
+!/release/nocturnerecomp.toml
 /*.so
 /*.dll
 
@@ -52,8 +58,13 @@ nocturnerecomp.toml
 # (the package itself and anything derived from it must NEVER be committed)
 9F2DAA064D494AA82B43B65362C59E9B89A88F8F58
 /game/
+/package/
 /assets/
 !/assets/.gitkeep
+
+# Local game-derived Homebrew Menu icon used by early Switch prototypes.
+# Public builds use the original artwork in switch/icon-public.jpg instead.
+/switch/icon.jpg
 
 # Title-update packages and anything extracted from them (copyrighted; the user
 # supplies their own — see scripts/extract_tu.py)
@@ -77,6 +88,8 @@ __pycache__/
 /tools/*
 !/tools/README.md
 !/tools/*.ps1
+!/tools/switch/
+!/tools/switch/**
 
 # Locally built libraries
 /local/

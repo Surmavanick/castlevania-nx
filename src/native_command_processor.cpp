@@ -21,6 +21,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/string/buffer.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/custom_shader.h>
@@ -29,6 +30,15 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+#endif
+
+REXCVAR_DEFINE_BOOL(
+    switch_skip_redundant_frontbuffer_resolve, true, "Video",
+    "Skip the Switch CPU readback of an exact full-screen swap-frontbuffer resolve when the "
+    "native presenter already consumes the render target directly (experimental)");
 
 namespace nocturne {
 
@@ -40,7 +50,88 @@ namespace nocturne {
 constexpr uint32_t kGameplayPreviewWidth = 512;
 constexpr uint32_t kGameplayPreviewHeight = 256;
 
+#if REX_PLATFORM_SWITCH
+// Exact stock-XPR identity of MEDIA/uiresource.xpr's `new_CloudsTop` resource.
+// The dimensions alone are deliberately not enough to suppress a draw: the
+// pitch/layout/format/endian fields must match too, then the raw 0x6C000-byte
+// texture payload is verified once with XXH3. The expected hash is over
+// [header_size + 12 + 0x2EE000, +0x6C000) in the shipped XPR (the 12 bytes are
+// XPR2's data-section padding). Once confirmed, subsequent draws compare only
+// the guest base address, keeping the steady-state test extremely cheap.
+constexpr uint32_t kSwitchCloudWidth = 852;
+constexpr uint32_t kSwitchCloudHeight = 128;
+constexpr uint32_t kSwitchCloudPitch = 864;
+constexpr uint32_t kSwitchCloudSourceSize = kSwitchCloudPitch * kSwitchCloudHeight * 4;
+constexpr uint64_t kSwitchCloudContentHash = UINT64_C(0x8814A07CEB7C7F5A);
+#endif
+
 namespace {
+
+// The Switch profiler consumes raw arm system-counter ticks. Going through
+// Clock keeps the instrumentation free of libnx types here, and compiles to
+// the same single counter-register read on Switch. Desktop builds keep these
+// call sites as no-ops so this renderer remains portable.
+inline uint64_t SwitchPerfTick() {
+#if REX_PLATFORM_SWITCH
+  return rex::chrono::Clock::QueryHostTickCount();
+#else
+  return 0;
+#endif
+}
+
+inline void SwitchPerfAdd(unsigned id, uint64_t value) {
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfAdd(id, value);
+#else
+  (void)id;
+  (void)value;
+#endif
+}
+
+class SwitchPerfScope {
+ public:
+  explicit SwitchPerfScope(unsigned id, bool enabled = true)
+      : id_(id), start_(enabled ? SwitchPerfTick() : 0), enabled_(enabled) {}
+
+  ~SwitchPerfScope() {
+    if (enabled_) {
+      SwitchPerfAdd(id_, SwitchPerfTick() - start_);
+    }
+  }
+
+  SwitchPerfScope(const SwitchPerfScope&) = delete;
+  SwitchPerfScope& operator=(const SwitchPerfScope&) = delete;
+
+ private:
+  unsigned id_;
+  uint64_t start_;
+  bool enabled_;
+};
+
+// Exact non-negative-coordinate specialization of texture_util::GetTiledOffset2D
+// for this resolve path's only supported destination format (RGBA8, 4 bytes
+// per texel). Keeping the integer address math in this translation unit lets
+// the compiler inline it into the hot four-pixel loop; the SDK helper was an
+// out-of-line call 230,400 times per 1280x720 frame.
+inline uint32_t GetTiledOffset2D4B(uint32_t x, uint32_t y, uint32_t pitch) {
+  pitch = (pitch + 31u) & ~31u;
+  uint32_t macro = ((x >> 5) + (y >> 5) * (pitch >> 5)) << 9;
+  uint32_t micro = ((x & 7u) + ((y & 0xEu) << 2)) << 2;
+  uint32_t offset = macro + ((micro & ~0xFu) << 1) + (micro & 0xFu) + ((y & 1u) << 4);
+  return ((offset & ~0x1FFu) << 3) + ((y & 16u) << 7) + ((offset & 0x1C0u) << 2) +
+         (((((y & 8u) >> 2) + (x >> 3)) & 3u) << 6) + (offset & 0x3Fu);
+}
+
+inline uint32_t GetTiledAddressUpperBound2D4B(uint32_t right, uint32_t bottom,
+                                               uint32_t pitch) {
+  if (!right || !bottom) {
+    return 0;
+  }
+  // Same conservative 32x32-tile upper bound as the SDK helper. Tiled
+  // addresses aren't monotonic in X, so offset(right - 1, y) is not a safe
+  // extent (for 1280x720 it misses the last 128 actually addressed bytes).
+  return GetTiledOffset2D4B((right - 1) & ~31u, (bottom - 1) & ~31u, pitch) + 0x1000u;
+}
 
 // Replicates xboxkrnl_video.cpp's GetConfiguredVideoModeWidth/Height (not
 // callable directly -- file-local there) so the render target this renderer
@@ -94,17 +185,21 @@ double ResolveVideoModeRefreshHz() {
 
 namespace {
 
-uint64_t HashUcode(const std::vector<uint32_t>& ucode) {
+uint64_t HashDwords(const uint32_t* dwords, size_t dword_count) {
   // FNV-1a over the raw dwords -- only needs to be a good cache key, not
   // cryptographically strong.
   uint64_t hash = 0xcbf29ce484222325ull;
-  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(ucode.data());
-  size_t byte_count = ucode.size() * sizeof(uint32_t);
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(dwords);
+  size_t byte_count = dword_count * sizeof(uint32_t);
   for (size_t i = 0; i < byte_count; ++i) {
     hash ^= bytes[i];
     hash *= 0x100000001b3ull;
   }
   return hash;
+}
+
+uint64_t HashUcode(const std::vector<uint32_t>& ucode) {
+  return HashDwords(ucode.data(), ucode.size());
 }
 
 // Decodes one 16-byte BC3/DXT5 block (already in host byte order, see the
@@ -371,6 +466,27 @@ void FlushMapped(const rex::ui::vulkan::VulkanDevice* vulkan_device, VkDeviceMem
   vulkan_device->functions().vkFlushMappedMemoryRanges(vulkan_device->device(), 1, &range);
 }
 
+// Persistent arenas are intentionally much larger than the prefix written in
+// a typical frame. Flush only that prefix, rounded to nonCoherentAtomSize,
+// rather than making a queued 512 KiB texture upload clean the entire 16 MiB
+// staging allocation on Switch.
+void FlushMappedPrefix(const rex::ui::vulkan::VulkanDevice* vulkan_device,
+                       VkDeviceMemory memory, VkDeviceSize written_size,
+                       VkDeviceSize allocation_size) {
+  if (!written_size) {
+    return;
+  }
+  VkDeviceSize atom_size = vulkan_device->properties().nonCoherentAtomSize;
+  VkDeviceSize flush_size =
+      std::min(allocation_size, (written_size + atom_size - 1) & ~(atom_size - 1));
+  VkMappedMemoryRange range{};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = memory;
+  range.offset = 0;
+  range.size = flush_size;
+  vulkan_device->functions().vkFlushMappedMemoryRanges(vulkan_device->device(), 1, &range);
+}
+
 }  // namespace
 
 NativeCommandProcessor::NativeCommandProcessor(rex::ui::vulkan::VulkanProvider* provider,
@@ -408,10 +524,9 @@ NativeCommandProcessor::NativeCommandProcessor(rex::ui::vulkan::VulkanProvider* 
   VkFenceCreateInfo fence_create_info;
   fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fence_create_info.pNext = nullptr;
-  // Pre-signaled: PresentFrame's first step waits on this fence as "the
-  // previous submission", but on the very first call there is no previous
-  // submission -- an unsignaled fence there hangs forever.
-  fence_create_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+  // Only waited when submit_fence_pending_ says a submission actually used
+  // it. EnsureFrameBegun resets it before the first (and every later) submit.
+  fence_create_info.flags = 0;
   if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &submit_fence_) != VK_SUCCESS) {
     REXGPU_ERROR("NativeCommandProcessor: failed to create the submit fence");
     return;
@@ -422,20 +537,48 @@ NativeCommandProcessor::NativeCommandProcessor(rex::ui::vulkan::VulkanProvider* 
   rex::graphics::SpirvShaderTranslator::Features features(provider_->vulkan_device());
   REXGPU_INFO(
       "NativeCommandProcessor: ready (pipeline_resources_valid={} depthClamp={} "
-      "max_storage_buffer_range={} shared_memory_binding_count={})",
+      "max_storage_buffer_range={} shared_memory_binding_count={} native_perf=v3 "
+      "resolve_inline_tiling=true switch_frontbuffer_resolve_skip={} switch_cloud_skip={})",
       pipeline_resources_valid_, provider_->vulkan_device()->properties().depthClamp,
       features.max_storage_buffer_range,
       1u << rex::graphics::SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
-          features.max_storage_buffer_range));
+          features.max_storage_buffer_range),
+#if REX_PLATFORM_SWITCH
+      REXCVAR_GET(switch_skip_redundant_frontbuffer_resolve) ? "v1" : "off",
+      "v1"
+#else
+      "off",
+      "off"
+#endif
+  );
 }
 
 NativeCommandProcessor::~NativeCommandProcessor() {
-  FreeTransientBuffers();
-  DestroyPipelineResources();
-
   const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
   const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
+
+  // PresentFrame leaves the final submission asynchronous so guest CPU work
+  // can overlap it. Do not tear down images, buffers or the command pool
+  // while that submission may still reference them.
+  if (submit_fence_pending_ && submit_fence_ != VK_NULL_HANDLE) {
+    VkResult wait_result =
+        dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
+    if (wait_result != VK_SUCCESS) {
+      // An in-flight command buffer may still reference every object below.
+      // On device loss, leaking until the Vulkan device itself is destroyed
+      // is safer than tearing those objects out from under the driver.
+      REXGPU_ERROR(
+          "NativeCommandProcessor: final-frame fence wait failed at shutdown ({}); "
+          "skipping Vulkan resource destruction",
+          static_cast<int32_t>(wait_result));
+      return;
+    }
+    submit_fence_pending_ = false;
+  }
+
+  FreeTransientBuffers();
+  DestroyPipelineResources();
 
   if (submit_fence_ != VK_NULL_HANDLE) {
     dfn.vkDestroyFence(device, submit_fence_, nullptr);
@@ -1071,6 +1214,30 @@ void NativeCommandProcessor::OnPacket(const rex::graphics::PacketInfo& info,
   }
 
   if (info.type_info && info.type_info->category == rex::graphics::PacketCategory::kSwap) {
+    // VdSwap's packet payload is signature, frontbuffer physical address,
+    // width, height. Remember it before presenting so the next frame's exact
+    // full-screen EDRAM resolve can be recognized as redundant: PresentFrame
+    // copies color_target_image_ directly and never reads this guest buffer.
+    auto payload_dword = [packet_base](uint32_t index) {
+      return rex::memory::load_and_swap<uint32_t>(packet_base + index * 4);
+    };
+    uint32_t swap_signature =
+        info.count >= 5 ? payload_dword(1) : 0;
+    if (info.count >= 5 && swap_signature == rex::graphics::xenos::kSwapSignature) {
+      uint32_t frontbuffer_address = payload_dword(2);
+      uint32_t frontbuffer_width = payload_dword(3);
+      uint32_t frontbuffer_height = payload_dword(4);
+      bool changed = frontbuffer_address != last_swap_frontbuffer_address_ ||
+                     frontbuffer_width != last_swap_frontbuffer_width_ ||
+                     frontbuffer_height != last_swap_frontbuffer_height_;
+      last_swap_frontbuffer_address_ = frontbuffer_address;
+      last_swap_frontbuffer_width_ = frontbuffer_width;
+      last_swap_frontbuffer_height_ = frontbuffer_height;
+      if (changed) {
+        REXGPU_INFO("NativeCommandProcessor: swap frontbuffer base={:08X} size={}x{}",
+                    frontbuffer_address, frontbuffer_width, frontbuffer_height);
+      }
+    }
     // Mirrors xenos's CommandProcessor: counter_ increments once per
     // PM4_XE_SWAP; EVENT_WRITE_SHD fences with the counter-select initiator
     // bit report this value (see the fence handler above).
@@ -1545,6 +1712,7 @@ bool NativeCommandProcessor::EndOneShotCommandsAndWait() {
     rex::ui::vulkan::VulkanDevice::Queue::Acquisition queue =
         vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
     ok = dfn.vkQueueSubmit(queue.queue(), 1, &submit_info, oneshot_fence_) == VK_SUCCESS;
+    SwitchPerfAdd(7, 1);
   }
   if (ok) {
     constexpr uint64_t kFenceTimeoutNs = 5'000'000'000ull;
@@ -1558,7 +1726,8 @@ bool NativeCommandProcessor::EndOneShotCommandsAndWait() {
 }
 
 bool NativeCommandProcessor::UploadTexelsAndTransition(VkImage image, uint32_t width,
-                                                        uint32_t height, const void* rgba_data) {
+                                                        uint32_t height, const void* rgba_data,
+                                                        VkImageLayout old_layout) {
   const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
   const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
@@ -1575,6 +1744,7 @@ bool NativeCommandProcessor::UploadTexelsAndTransition(VkImage image, uint32_t w
   void* mapped = nullptr;
   dfn.vkMapMemory(device, staging_memory, 0, data_size, 0, &mapped);
   std::memcpy(mapped, rgba_data, data_size);
+  SwitchPerfAdd(15, uint64_t(data_size));
   FlushMapped(vulkan_device, staging_memory);
   dfn.vkUnmapMemory(device, staging_memory);
 
@@ -1588,14 +1758,23 @@ bool NativeCommandProcessor::UploadTexelsAndTransition(VkImage image, uint32_t w
 
     VkImageMemoryBarrier to_transfer_dst{};
     to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_transfer_dst.srcAccessMask = old_layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                         ? 0
+                                         : VK_ACCESS_SHADER_READ_BIT;
     to_transfer_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_transfer_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_transfer_dst.oldLayout = old_layout;
     to_transfer_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     to_transfer_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_transfer_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_transfer_dst.image = image;
     to_transfer_dst.subresourceRange = subresource_range;
-    dfn.vkCmdPipelineBarrier(upload_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    VkPipelineStageFlags source_stage =
+        old_layout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+               VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    dfn.vkCmdPipelineBarrier(upload_cmd, source_stage,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &to_transfer_dst);
 
@@ -1615,9 +1794,11 @@ bool NativeCommandProcessor::UploadTexelsAndTransition(VkImage image, uint32_t w
     to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_shader_read.image = image;
     to_shader_read.subresourceRange = subresource_range;
-    dfn.vkCmdPipelineBarrier(upload_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &to_shader_read);
+    dfn.vkCmdPipelineBarrier(
+        upload_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &to_shader_read);
 
     ok = EndOneShotCommandsAndWait();
   }
@@ -1625,6 +1806,32 @@ bool NativeCommandProcessor::UploadTexelsAndTransition(VkImage image, uint32_t w
   dfn.vkDestroyBuffer(device, staging_buffer, nullptr);
   dfn.vkFreeMemory(device, staging_memory, nullptr);
   return ok;
+}
+
+bool NativeCommandProcessor::QueueTextureUpload(VkImage image, uint32_t width,
+                                                uint32_t height, const void* rgba_data,
+                                                VkImageLayout old_layout) {
+  if (!frame_active_ || image == VK_NULL_HANDLE || !shared_memory_staging_mapped_ ||
+      !width || !height) {
+    return false;
+  }
+
+  const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
+  VkDeviceSize data_size = VkDeviceSize(width) * VkDeviceSize(height) * 4;
+  VkDeviceSize alignment =
+      std::max<VkDeviceSize>(4, vulkan_device->properties().optimalBufferCopyOffsetAlignment);
+  VkDeviceSize staging_offset =
+      (shared_memory_staging_offset_ + alignment - 1) & ~(alignment - 1);
+  if (staging_offset > kSharedMemoryStagingSize ||
+      data_size > kSharedMemoryStagingSize - staging_offset) {
+    return false;
+  }
+
+  std::memcpy(shared_memory_staging_mapped_ + staging_offset, rgba_data, size_t(data_size));
+  SwitchPerfAdd(15, uint64_t(data_size));
+  pending_texture_uploads_.push_back({image, staging_offset, width, height, old_layout});
+  shared_memory_staging_offset_ = staging_offset + data_size;
+  return true;
 }
 
 namespace {
@@ -2360,14 +2567,47 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
     return nullptr;
   }
 
-  uint64_t key = HashUcode({fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
-                           fetch.dword_4, fetch.dword_5});
+  uint32_t width = fetch.size_2d.width + 1;
+  uint32_t height = fetch.size_2d.height + 1;
+  uint32_t base_address = fetch.base_address << 12;
+  bool is_gameplay_preview =
+      width == kGameplayPreviewWidth && height == kGameplayPreviewHeight;
+  bool post_process_active =
+      is_gameplay_preview && rex::cvar::Query<bool>("post_process_shader_enabled") &&
+      !rex::cvar::Query<std::string>("post_process_shader_path").empty();
+  bool replacement_work_enabled =
+      texture_replacement_ &&
+      (!texture_replacement_->mod_roots().empty() || REXCVAR_GET(texture_dump_enabled));
+  bool reusable_gameplay_preview =
+      is_gameplay_preview && !post_process_active && !replacement_work_enabled;
+
+  const uint32_t fetch_dwords[] = {fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                                   fetch.dword_3, fetch.dword_4, fetch.dword_5};
+  uint64_t key = HashDwords(fetch_dwords, 6);
+  const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
+  const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+
+  UploadedTexture* reusable_texture = nullptr;
   auto existing = texture_cache_.find(key);
   if (existing != texture_cache_.end()) {
-    return &existing->second;
+    if (!existing->second.dirty) {
+      return &existing->second;
+    }
+    if (existing->second.reusable_gameplay_preview && reusable_gameplay_preview) {
+      reusable_texture = &existing->second;
+    } else {
+      if (existing->second.view != VK_NULL_HANDLE)
+        dfn.vkDestroyImageView(device, existing->second.view, nullptr);
+      if (existing->second.image != VK_NULL_HANDLE)
+        dfn.vkDestroyImage(device, existing->second.image, nullptr);
+      if (existing->second.memory != VK_NULL_HANDLE)
+        dfn.vkFreeMemory(device, existing->second.memory, nullptr);
+      texture_cache_.erase(existing);
+    }
   }
 
-  if (texture_cache_.size() >= kMaxTextureCacheEntries) {
+  if (!reusable_texture && texture_cache_.size() >= kMaxTextureCacheEntries) {
     if (!texture_cache_limit_logged_) {
       texture_cache_limit_logged_ = true;
       REXGPU_ERROR(
@@ -2378,9 +2618,14 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
     return nullptr;
   }
 
-  uint32_t width = fetch.size_2d.width + 1;
-  uint32_t height = fetch.size_2d.height + 1;
-  uint32_t base_address = fetch.base_address << 12;
+  // Profile only refreshes of the already-created, dirty 512x256 gameplay
+  // preview. Initial creation and unrelated texture uploads intentionally do
+  // not contribute to the preview-specific counters.
+  const bool profile_preview_refresh = reusable_texture != nullptr;
+  SwitchPerfScope preview_total_timer(91, profile_preview_refresh);
+  if (profile_preview_refresh) {
+    SwitchPerfAdd(90, 1);
+  }
 
   const uint8_t* guest_base =
       rex::system::kernel_state()->memory()->TranslatePhysical<const uint8_t*>(base_address);
@@ -2413,6 +2658,29 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
     source_size_bytes = pitch_texels * height * bytes_per_texel;
   }
 
+#if REX_PLATFORM_SWITCH
+  // If previously unseen content ever starts sampling the guest frontbuffer
+  // range, keep that observation sticky and restore real resolves from the
+  // next frame onward. Existing cached consumers already block the skip in
+  // TryResolveCopy; this catches a consumer introduced by a later screen or
+  // transition so the experiment fails safe for the remainder of the run.
+  if (!switch_frontbuffer_resolve_skip_disabled_ &&
+      switch_last_skipped_frontbuffer_address_ != 0) {
+    const uint64_t texture_start = base_address;
+    const uint64_t texture_end = texture_start + source_size_bytes;
+    const uint64_t skipped_start = switch_last_skipped_frontbuffer_address_;
+    const uint64_t skipped_end = skipped_start + switch_last_skipped_frontbuffer_size_;
+    if (texture_start < skipped_end && skipped_start < texture_end) {
+      switch_frontbuffer_resolve_skip_disabled_ = true;
+      REXGPU_INFO(
+          "NativeCommandProcessor: disabling frontbuffer resolve skip after texture consumer "
+          "appeared (fetch_constant={} texture={:08X}+{} frontbuffer={:08X}+{})",
+          fetch_constant_index, base_address, source_size_bytes,
+          switch_last_skipped_frontbuffer_address_, switch_last_skipped_frontbuffer_size_);
+    }
+  }
+#endif
+
   // Mod texture replacement (see InitializeTextureReplacement): hash the raw
   // guest bytes exactly as rex::graphics::TextureReplacement::HashGuestData
   // does for the D3D12/Vulkan xenos backends' own texture cache, so existing
@@ -2429,7 +2697,7 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
   // cache-invalidation range, not for byte-for-byte hash parity with mods
   // authored against the real backend's dumps).
   const TextureReplacementData* replacement = nullptr;
-  if (texture_replacement_) {
+  if (replacement_work_enabled) {
     rex::graphics::texture_util::TextureGuestLayout guest_layout =
         rex::graphics::texture_util::GetGuestTextureLayout(
             fetch.dimension, fetch.pitch, width, height, /*depth_or_array_size=*/1, fetch.tiled,
@@ -2444,6 +2712,11 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
                                          fetch.tiled != 0, fetch.format, fetch.endianness,
                                          hash_base, hash_size_bytes);
     }
+  }
+
+  const uint64_t preview_decode_start = SwitchPerfTick();
+  if (!replacement) {
+    SwitchPerfAdd(14, 1);
   }
 
   if (replacement) {
@@ -2569,14 +2842,35 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
       }
     }
   }
+  if (profile_preview_refresh) {
+    SwitchPerfAdd(92, SwitchPerfTick() - preview_decode_start);
+  }
 
-  const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
-  const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  VkDevice device = vulkan_device->device();
+  if (reusable_texture) {
+    const uint64_t preview_upload_start = SwitchPerfTick();
+    bool uploaded = QueueTextureUpload(reusable_texture->image, rgba_width, rgba_height,
+                                       rgba.data(), VK_IMAGE_LAYOUT_UNDEFINED);
+    if (!uploaded) {
+      uploaded = UploadTexelsAndTransition(
+          reusable_texture->image, rgba_width, rgba_height, rgba.data(),
+          VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+    SwitchPerfAdd(93, SwitchPerfTick() - preview_upload_start);
+    if (!uploaded) {
+      REXGPU_ERROR("NativeCommandProcessor: failed to refresh gameplay-preview texture");
+      return reusable_texture;
+    }
+    reusable_texture->base_address_bytes = base_address;
+    reusable_texture->size_bytes = source_size_bytes;
+    reusable_texture->dirty = false;
+    return reusable_texture;
+  }
 
-  UploadedTexture texture;
+  UploadedTexture texture{};
   texture.base_address_bytes = base_address;
   texture.size_bytes = source_size_bytes;
+  texture.is_gameplay_preview = is_gameplay_preview;
+  texture.reusable_gameplay_preview = reusable_gameplay_preview;
   VkImageCreateInfo image_info{};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_info.imageType = VK_IMAGE_TYPE_2D;
@@ -2610,7 +2904,13 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
     return nullptr;
   }
 
-  if (!UploadTexelsAndTransition(texture.image, rgba_width, rgba_height, rgba.data())) {
+  bool uploaded = texture.reusable_gameplay_preview &&
+                  QueueTextureUpload(texture.image, rgba_width, rgba_height, rgba.data(),
+                                     VK_IMAGE_LAYOUT_UNDEFINED);
+  if (!uploaded) {
+    uploaded = UploadTexelsAndTransition(texture.image, rgba_width, rgba_height, rgba.data());
+  }
+  if (!uploaded) {
     REXGPU_ERROR("NativeCommandProcessor: failed to upload texture data ({}x{})", rgba_width,
                 rgba_height);
     dfn.vkDestroyImageView(device, texture.view, nullptr);
@@ -2631,10 +2931,7 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
   // filtered result on success; on any failure (feature off, no shader
   // configured, compile error), texture keeps the raw upload from just
   // above, so this can never make an otherwise-working texture disappear.
-  texture.is_gameplay_preview =
-      width == kGameplayPreviewWidth && height == kGameplayPreviewHeight;
-  if (texture.is_gameplay_preview && rex::cvar::Query<bool>("post_process_shader_enabled") &&
-      !rex::cvar::Query<std::string>("post_process_shader_path").empty()) {
+  if (post_process_active) {
     VkImage filtered_image;
     VkDeviceMemory filtered_memory;
     VkImageView filtered_view;
@@ -2646,6 +2943,15 @@ NativeCommandProcessor::UploadedTexture* NativeCommandProcessor::GetOrUploadText
       texture.image = filtered_image;
       texture.memory = filtered_memory;
       texture.view = filtered_view;
+    }
+  }
+
+  if (texture.reusable_gameplay_preview) {
+    static bool queued_preview_logged = false;
+    if (!queued_preview_logged) {
+      queued_preview_logged = true;
+      REXGPU_INFO(
+          "NativeCommandProcessor: gameplay preview uses queued upload and persistent image");
     }
   }
 
@@ -3084,6 +3390,7 @@ void NativeCommandProcessor::UpdateSharedMemory(uint32_t guest_address_dwords,
     void* mapped = nullptr;
     dfn.vkMapMemory(device, scratch_memory, 0, byte_size, 0, &mapped);
     std::memcpy(mapped, guest_ptr, byte_size);
+    SwitchPerfAdd(15, byte_size);
     FlushMapped(vulkan_device, scratch_memory);
     dfn.vkUnmapMemory(device, scratch_memory);
     VkCommandBuffer cmd = BeginOneShotCommands();
@@ -3098,13 +3405,14 @@ void NativeCommandProcessor::UpdateSharedMemory(uint32_t guest_address_dwords,
   }
 
   std::memcpy(shared_memory_staging_mapped_ + shared_memory_staging_offset_, guest_ptr, byte_size);
+  SwitchPerfAdd(15, byte_size);
   pending_shared_copies_.push_back(
       VkBufferCopy{shared_memory_staging_offset_, byte_offset, byte_size});
   shared_memory_staging_offset_ += byte_size;
 }
 
 void NativeCommandProcessor::FlushPendingSharedMemoryCopies() {
-  if (pending_shared_copies_.empty()) {
+  if (pending_shared_copies_.empty() && pending_texture_uploads_.empty()) {
     return;
   }
 
@@ -3119,24 +3427,71 @@ void NativeCommandProcessor::FlushPendingSharedMemoryCopies() {
   // dynamic state persist -- unlike TryResolveCopy, this needs no re-set.
   dfn.vkCmdEndRenderPass(command_buffer_);
 
-  dfn.vkCmdCopyBuffer(command_buffer_, shared_memory_staging_buffer_, shared_memory_buffer_,
-                      uint32_t(pending_shared_copies_.size()), pending_shared_copies_.data());
-  pending_shared_copies_.clear();
+  const VkPipelineStageFlags shader_stages =
+      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+      VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
-  VkBufferMemoryBarrier barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.buffer = shared_memory_buffer_;
-  barrier.offset = 0;
-  barrier.size = VK_WHOLE_SIZE;
-  dfn.vkCmdPipelineBarrier(
-      command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
-          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-      0, 0, nullptr, 1, &barrier, 0, nullptr);
+  if (!pending_shared_copies_.empty()) {
+    dfn.vkCmdCopyBuffer(command_buffer_, shared_memory_staging_buffer_, shared_memory_buffer_,
+                        uint32_t(pending_shared_copies_.size()), pending_shared_copies_.data());
+    pending_shared_copies_.clear();
+
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = shared_memory_buffer_;
+    barrier.offset = 0;
+    barrier.size = VK_WHOLE_SIZE;
+    dfn.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages, 0, 0,
+                             nullptr, 1, &barrier, 0, nullptr);
+  }
+
+  for (const PendingTextureUpload& upload : pending_texture_uploads_) {
+    VkImageSubresourceRange subresource_range =
+        rex::ui::vulkan::util::InitializeSubresourceRange();
+    VkImageMemoryBarrier to_transfer_dst{};
+    to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_transfer_dst.srcAccessMask = upload.old_layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                         ? 0
+                                         : VK_ACCESS_SHADER_READ_BIT;
+    to_transfer_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_transfer_dst.oldLayout = upload.old_layout;
+    to_transfer_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_transfer_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer_dst.image = upload.image;
+    to_transfer_dst.subresourceRange = subresource_range;
+    VkPipelineStageFlags source_stage =
+        upload.old_layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                                       : shader_stages;
+    dfn.vkCmdPipelineBarrier(command_buffer_, source_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &to_transfer_dst);
+
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = upload.staging_offset;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {upload.width, upload.height, 1};
+    dfn.vkCmdCopyBufferToImage(command_buffer_, shared_memory_staging_buffer_, upload.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    VkImageMemoryBarrier to_shader_read{};
+    to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_shader_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_shader_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader_read.image = upload.image;
+    to_shader_read.subresourceRange = subresource_range;
+    dfn.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages, 0, 0,
+                             nullptr, 0, nullptr, 1, &to_shader_read);
+  }
+  pending_texture_uploads_.clear();
 
   VkRenderPassBeginInfo rp_begin{};
   rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3248,6 +3603,67 @@ void NativeCommandProcessor::TryResolveCopy() {
   uint32_t width = uint32_t(x1 - x0);
   uint32_t height = uint32_t(y1 - y0);
   uint32_t pitch_texels = std::max(copy_dest_pitch.copy_dest_pitch, width);
+  SwitchPerfScope resolve_total_timer(86);
+  SwitchPerfAdd(9, 1);
+  SwitchPerfAdd(10, uint64_t(width) * height);
+
+  // Exact upper bound of bytes touched in the tiled destination. Compute it
+  // once and reuse it for both the guarded frontbuffer skip and cache
+  // invalidation below.
+  uint32_t written_size_bytes =
+      GetTiledAddressUpperBound2D4B(width, height, pitch_texels);
+
+#if REX_PLATFORM_SWITCH
+  // This custom renderer presents color_target_image_ directly, so the
+  // normal full-screen EDRAM -> guest frontbuffer copy is duplicate work on
+  // Switch (one synchronous GPU readback plus a CPU retile/convert). Keep the
+  // optimization deliberately narrow and reversible: only the exact buffer
+  // announced by the preceding VdSwap, with matching full-target dimensions
+  // and pitch, and only while no uploaded texture aliases that range.
+  bool exact_swap_frontbuffer =
+      REXCVAR_GET(switch_skip_redundant_frontbuffer_resolve) &&
+      !switch_frontbuffer_resolve_skip_disabled_ && last_swap_frontbuffer_address_ != 0 &&
+      dest_base == last_swap_frontbuffer_address_ && x0 == 0 && y0 == 0 &&
+      width == color_target_width_ && height == color_target_height_ &&
+      pitch_texels == color_target_width_ && last_swap_frontbuffer_width_ == width &&
+      last_swap_frontbuffer_height_ == height;
+  bool cached_texture_overlaps = false;
+  if (exact_swap_frontbuffer) {
+    const uint64_t resolve_start = dest_base;
+    const uint64_t resolve_end = resolve_start + written_size_bytes;
+    for (const auto& [key, texture] : texture_cache_) {
+      (void)key;
+      const uint64_t texture_start = texture.base_address_bytes;
+      const uint64_t texture_end = texture_start + texture.size_bytes;
+      if (texture_start < resolve_end && resolve_start < texture_end) {
+        cached_texture_overlaps = true;
+        break;
+      }
+    }
+  }
+  if (exact_swap_frontbuffer && !cached_texture_overlaps) {
+    switch_last_skipped_frontbuffer_address_ = dest_base;
+    switch_last_skipped_frontbuffer_size_ = written_size_bytes;
+    ++switch_frontbuffer_resolves_skipped_;
+    if (switch_frontbuffer_resolves_skipped_ == 1 ||
+        switch_frontbuffer_resolves_skipped_ % 600 == 0) {
+      REXGPU_INFO(
+          "NativeCommandProcessor: switch_frontbuffer_resolve_skip=v1 skipped={} "
+          "base={:08X} size={} rect={}x{} pitch={}",
+          switch_frontbuffer_resolves_skipped_, dest_base, written_size_bytes, width, height,
+          pitch_texels);
+    }
+    return;
+  }
+  if (exact_swap_frontbuffer && cached_texture_overlaps &&
+      !switch_frontbuffer_resolve_overlap_logged_) {
+    switch_frontbuffer_resolve_overlap_logged_ = true;
+    REXGPU_INFO(
+        "NativeCommandProcessor: frontbuffer resolve skip blocked by cached texture overlap "
+        "(base={:08X} size={})",
+        dest_base, written_size_bytes);
+  }
+#endif
 
   // Read back color_target_image_'s current content -- this must happen now,
   // synchronously, since the resolve needs the render target's contents as
@@ -3258,12 +3674,17 @@ void NativeCommandProcessor::TryResolveCopy() {
   // submits + waits on submit_fence_, then reopens recording via
   // render_pass_continue_ (loadOp=LOAD) so draws after this resolve in the
   // same guest frame still land in the same buffer.
-  EnsureFrameBegun();
+  if (!EnsureFrameBegun()) {
+    return;
+  }
 
   const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
   const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
 
+  // A previous draw may have queued an image upload before taking an early
+  // return. Record it before this path submits the current command buffer.
+  FlushPendingSharedMemoryCopies();
   dfn.vkCmdEndRenderPass(command_buffer_);
 
   // Persistent readback buffer (see header): this runs every frame at some
@@ -3278,6 +3699,16 @@ void NativeCommandProcessor::TryResolveCopy() {
       REXGPU_ERROR("NativeCommandProcessor: resolve copy failed to allocate a readback buffer");
       resolve_readback_buffer_ = VK_NULL_HANDLE;
       resolve_readback_memory_ = VK_NULL_HANDLE;
+      // Uploads already recorded into this command buffer were never
+      // submitted, so make the persistent preview eligible for upload again.
+      for (auto& cache_entry : texture_cache_) {
+        UploadedTexture& texture = cache_entry.second;
+        if (texture.reusable_gameplay_preview) {
+          texture.dirty = true;
+        }
+      }
+      dfn.vkEndCommandBuffer(command_buffer_);
+      frame_active_ = false;
       return;
     }
   }
@@ -3288,13 +3719,15 @@ void NativeCommandProcessor::TryResolveCopy() {
   // the (non-coherent) constants/index arenas -- flush them now, same as
   // PresentFrame does before its own submit.
   if (constants_arena_offset_ > 0) {
-    FlushMapped(vulkan_device, constants_arena_memory_);
+    FlushMappedPrefix(vulkan_device, constants_arena_memory_, constants_arena_offset_,
+                      kConstantsArenaSize);
   }
   if (index_arena_offset_ > 0) {
-    FlushMapped(vulkan_device, index_arena_memory_);
+    FlushMappedPrefix(vulkan_device, index_arena_memory_, index_arena_offset_, kIndexArenaSize);
   }
   if (shared_memory_staging_offset_ > 0) {
-    FlushMapped(vulkan_device, shared_memory_staging_memory_);
+    FlushMappedPrefix(vulkan_device, shared_memory_staging_memory_, shared_memory_staging_offset_,
+                      kSharedMemoryStagingSize);
   }
 
   VkBufferImageCopy buffer_image_copy{};
@@ -3311,14 +3744,45 @@ void NativeCommandProcessor::TryResolveCopy() {
   submit_info.pCommandBuffers = &command_buffer_;
   rex::ui::vulkan::VulkanDevice::Queue::Acquisition queue =
       vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
-  dfn.vkQueueSubmit(queue.queue(), 1, &submit_info, submit_fence_);
-  constexpr uint64_t kFenceTimeoutNs = 5'000'000'000ull;
-  if (dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, kFenceTimeoutNs) != VK_SUCCESS) {
-    REXGPU_ERROR("NativeCommandProcessor: timed out waiting for the resolve copy's fence");
+  VkResult submit_result = dfn.vkQueueSubmit(queue.queue(), 1, &submit_info, submit_fence_);
+  SwitchPerfAdd(7, 1);
+  submit_fence_pending_ = submit_result == VK_SUCCESS;
+  if (!submit_fence_pending_) {
+    REXGPU_ERROR("NativeCommandProcessor: resolve copy vkQueueSubmit failed ({})",
+                 static_cast<int32_t>(submit_result));
+    for (auto& cache_entry : texture_cache_) {
+      UploadedTexture& texture = cache_entry.second;
+      if (texture.reusable_gameplay_preview) {
+        texture.dirty = true;
+      }
+    }
+    frame_active_ = false;
+    return;
   }
-  dfn.vkResetFences(device, 1, &submit_fence_);
+
+  const uint64_t resolve_fence_start = SwitchPerfTick();
+  VkResult wait_result =
+      dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
+  SwitchPerfAdd(87, SwitchPerfTick() - resolve_fence_start);
+  if (wait_result != VK_SUCCESS) {
+    // The submission may still own the command buffer and all frame
+    // resources. Leave it pending so EnsureFrameBegun will not recycle them.
+    REXGPU_ERROR("NativeCommandProcessor: resolve copy fence wait failed ({})",
+                 static_cast<int32_t>(wait_result));
+    frame_active_ = false;
+    return;
+  }
+  submit_fence_pending_ = false;
+  VkResult reset_result = dfn.vkResetFences(device, 1, &submit_fence_);
+  if (reset_result != VK_SUCCESS) {
+    REXGPU_ERROR("NativeCommandProcessor: resolve copy fence reset failed ({})",
+                 static_cast<int32_t>(reset_result));
+    frame_active_ = false;
+    return;
+  }
 
   void* mapped = nullptr;
+  uint64_t resolve_readback_start = SwitchPerfTick();
   if (dfn.vkMapMemory(device, readback_memory, 0, color_target_staging_size_, 0, &mapped) ==
       VK_SUCCESS) {
     VkMappedMemoryRange range{};
@@ -3327,6 +3791,7 @@ void NativeCommandProcessor::TryResolveCopy() {
     range.offset = 0;
     range.size = VK_WHOLE_SIZE;
     dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    SwitchPerfAdd(88, SwitchPerfTick() - resolve_readback_start);
 
     // color_target_image_ is VK_FORMAT_A2B10G10R10_UNORM_PACK32 -- convert
     // to RGBA8 (this narrow implementation's only supported dest format) on
@@ -3336,30 +3801,54 @@ void NativeCommandProcessor::TryResolveCopy() {
     const uint32_t* src_pixels = reinterpret_cast<const uint32_t*>(mapped);
     uint8_t* guest_base = rex::system::kernel_state()->memory()->TranslatePhysical<uint8_t*>(dest_base);
     bool byteswap = copy_dest_info.copy_dest_endian != xenos::Endian128::kNone;
+    const uint64_t resolve_convert_start = SwitchPerfTick();
+    auto convert_pixel = [byteswap](uint32_t packed, uint8_t* rgba) {
+      // A2B10G10R10_UNORM_PACK32: R in bits 0-9, G in 10-19, B in 20-29,
+      // A in 30-31 -- downsampled to 8 bits/channel (truncated, not
+      // rounded/dithered, matching this file's other 16-to-8-bit
+      // downsamples).
+      rgba[0] = uint8_t((packed >> 2) & 0xFF);
+      rgba[1] = uint8_t((packed >> 12) & 0xFF);
+      rgba[2] = uint8_t((packed >> 22) & 0xFF);
+      rgba[3] = uint8_t(((packed >> 30) & 0x3) * 85);
+      if (byteswap) {
+        std::swap(rgba[0], rgba[3]);
+        std::swap(rgba[1], rgba[2]);
+      }
+    };
     for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        uint32_t src_x = x0 + x;
-        uint32_t src_y = y0 + y;
-        uint32_t packed = src_pixels[src_y * color_target_width_ + src_x];
+      const uint32_t* src_row =
+          src_pixels + size_t(y0 + y) * color_target_width_ + uint32_t(x0);
+      uint32_t x = 0;
+
+      // At 32 bits per texel, every four X-aligned texels occupy one
+      // contiguous 16-byte portion of the Xenos tiled layout. Resolve four
+      // pixels per address calculation and store, rather than calling the
+      // out-of-line GetTiledOffset2D and memcpy for every pixel. The live
+      // 1280-pixel resolve width has no scalar tail, but keep one for partial
+      // resolve rectangles.
+      for (; x + 4 <= width; x += 4) {
+        uint8_t rgba[16];
+        convert_pixel(src_row[x + 0], rgba + 0);
+        convert_pixel(src_row[x + 1], rgba + 4);
+        convert_pixel(src_row[x + 2], rgba + 8);
+        convert_pixel(src_row[x + 3], rgba + 12);
+        uint32_t dest_offset = GetTiledOffset2D4B(x, y, pitch_texels);
+        std::memcpy(guest_base + dest_offset, rgba, 16);
+      }
+      for (; x < width; ++x) {
         uint8_t rgba[4];
-        // A2B10G10R10_UNORM_PACK32: R in bits 0-9, G in 10-19, B in 20-29,
-        // A in 30-31 -- downsampled to 8 bits/channel (truncated, not
-        // rounded/dithered, matching this file's other 16-to-8-bit
-        // downsamples).
-        rgba[0] = uint8_t((packed >> 2) & 0xFF);
-        rgba[1] = uint8_t((packed >> 12) & 0xFF);
-        rgba[2] = uint8_t((packed >> 22) & 0xFF);
-        rgba[3] = uint8_t(((packed >> 30) & 0x3) * 85);
-        if (byteswap) {
-          std::swap(rgba[0], rgba[3]);
-          std::swap(rgba[1], rgba[2]);
-        }
-        uint32_t dest_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-            int32_t(x), int32_t(y), pitch_texels, /*bytes_per_texel_log2=*/2u));
+        convert_pixel(src_row[x], rgba);
+        uint32_t dest_offset = GetTiledOffset2D4B(x, y, pitch_texels);
         std::memcpy(guest_base + dest_offset, rgba, 4);
       }
     }
+    SwitchPerfAdd(89, SwitchPerfTick() - resolve_convert_start);
+    resolve_readback_start = SwitchPerfTick();
     dfn.vkUnmapMemory(device, readback_memory);
+    SwitchPerfAdd(88, SwitchPerfTick() - resolve_readback_start);
+  } else {
+    SwitchPerfAdd(88, SwitchPerfTick() - resolve_readback_start);
   }
   // readback_buffer/memory are the persistent resolve_readback_* members --
   // destroyed in DestroyPipelineResources, not here.
@@ -3367,14 +3856,6 @@ void NativeCommandProcessor::TryResolveCopy() {
   // Invalidate any cached texture upload whose decode source overlaps what
   // was just written -- same staleness problem the COHER_STATUS_HOST
   // handler in OnPacket fixes generally, kept here too as defense in depth.
-  uint32_t written_size_bytes = 0;
-  for (uint32_t y = 0; y < height; ++y) {
-    written_size_bytes = std::max(
-        written_size_bytes,
-        uint32_t(rex::graphics::texture_util::GetTiledOffset2D(int32_t(width - 1), int32_t(y),
-                                                                pitch_texels, 2u)) +
-            4);
-  }
   InvalidateTextureCacheRange(dest_base, written_size_bytes);
 
   // Reopen recording so subsequent draws in this same guest frame still
@@ -3412,23 +3893,37 @@ void NativeCommandProcessor::TryResolveCopy() {
   dfn.vkCmdSetScissor(command_buffer_, 0, 1, &scissor);
 }
 
-void NativeCommandProcessor::EnsureFrameBegun() {
+bool NativeCommandProcessor::EnsureFrameBegun() {
   if (frame_active_) {
-    return;
+    return true;
   }
 
   const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
   const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
 
-  // Waiting here (rather than in PresentFrame) is what makes it safe to
-  // free last frame's transient buffers/descriptor sets right after: by the
-  // time this returns, the GPU is done with everything submitted last frame.
-  constexpr uint64_t kFenceTimeoutNs = 5'000'000'000ull;
-  if (dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, kFenceTimeoutNs) != VK_SUCCESS) {
-    REXGPU_ERROR("NativeCommandProcessor: timed out waiting for the previous frame's fence");
+  // Waiting here (rather than in PresentFrame) is what makes it safe to free
+  // last frame's transient resources. A presenter failure may skip submission
+  // entirely, so never wait unless the fence is known to be in flight.
+  if (submit_fence_pending_) {
+    SwitchPerfAdd(94, 1);
+    const uint64_t frame_begin_wait_start = SwitchPerfTick();
+    VkResult wait_result =
+        dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
+    SwitchPerfAdd(95, SwitchPerfTick() - frame_begin_wait_start);
+    if (wait_result != VK_SUCCESS) {
+      REXGPU_ERROR("NativeCommandProcessor: previous-frame fence wait failed ({})",
+                   static_cast<int32_t>(wait_result));
+      return false;
+    }
+    submit_fence_pending_ = false;
   }
-  dfn.vkResetFences(device, 1, &submit_fence_);
+  VkResult reset_result = dfn.vkResetFences(device, 1, &submit_fence_);
+  if (reset_result != VK_SUCCESS) {
+    REXGPU_ERROR("NativeCommandProcessor: frame fence reset failed ({})",
+                 static_cast<int32_t>(reset_result));
+    return false;
+  }
 
   // Now safe to actually destroy anything queued by InvalidateTextureCacheRange
   // since the fence wait above -- see pending_texture_cache_invalidations_'s
@@ -3440,6 +3935,11 @@ void NativeCommandProcessor::EnsureFrameBegun() {
         uint32_t tex_start = it->second.base_address_bytes;
         uint32_t tex_end = tex_start + it->second.size_bytes;
         if (tex_start < inv_end && inv_base < tex_end) {
+          if (it->second.reusable_gameplay_preview) {
+            it->second.dirty = true;
+            ++it;
+            continue;
+          }
           if (it->second.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, it->second.view, nullptr);
           if (it->second.image != VK_NULL_HANDLE) dfn.vkDestroyImage(device, it->second.image, nullptr);
           if (it->second.memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device, it->second.memory, nullptr);
@@ -3461,6 +3961,7 @@ void NativeCommandProcessor::EnsureFrameBegun() {
   index_arena_offset_ = 0;
   shared_memory_staging_offset_ = 0;
   pending_shared_copies_.clear();
+  pending_texture_uploads_.clear();
 
   VkCommandBufferBeginInfo begin_info{};
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -3495,6 +3996,7 @@ void NativeCommandProcessor::EnsureFrameBegun() {
 
   frame_active_ = true;
   frame_has_draws_ = false;
+  return true;
 }
 
 void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_type,
@@ -3514,6 +4016,8 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
     TryResolveCopy();
     return;
   }
+
+  const uint64_t draw_start = SwitchPerfTick();
 
   if (num_indices == 0) {
     return;
@@ -3649,6 +4153,84 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
     return;
   }
 
+#if REX_PLATFORM_SWITCH
+  // Skip the actual draw for the XBLA shell's animated `new_CloudsTop`
+  // texture. Do this before translation, pipeline lookup, descriptor/constant
+  // setup and vkCmdDraw, so the experiment removes both its guest draw
+  // submission overhead and its GPU work rather than merely making the
+  // texture transparent. Restrict the search to pixel-shader bindings: this
+  // is sampled artwork, not vertex data.
+  bool samples_confirmed_cloud = false;
+  for (const auto& binding : pixel_shader_analyzed->texture_bindings()) {
+    const auto fetch = registers_.GetTextureFetch(binding.fetch_constant);
+    const uint32_t width = fetch.size_2d.width + 1;
+    const uint32_t height = fetch.size_2d.height + 1;
+    const uint32_t pitch = fetch.pitch * 32u;
+    const uint32_t base_address = fetch.base_address << 12;
+    const bool metadata_matches =
+        fetch.type == rex::graphics::xenos::FetchConstantType::kTexture &&
+        fetch.dimension == rex::graphics::xenos::DataDimension::k2DOrStacked &&
+        !fetch.stacked && fetch.tiled && fetch.packed_mips && fetch.mip_min_level == 0 &&
+        fetch.mip_max_level == 0 &&
+        fetch.format == rex::graphics::xenos::TextureFormat::k_8_8_8_8 &&
+        fetch.endianness == rex::graphics::xenos::Endian::k8in32 &&
+        width == kSwitchCloudWidth && height == kSwitchCloudHeight &&
+        pitch == kSwitchCloudPitch && base_address != 0;
+    if (!metadata_matches) {
+      continue;
+    }
+
+    if (base_address == switch_cloud_texture_base_address_) {
+      samples_confirmed_cloud = true;
+      break;
+    }
+    if (switch_rejected_cloud_texture_bases_.count(base_address)) {
+      continue;
+    }
+
+    const uint8_t* source =
+        rex::system::kernel_state()->memory()->TranslatePhysical<const uint8_t*>(base_address);
+    if (!source) {
+      switch_rejected_cloud_texture_bases_.insert(base_address);
+      REXGPU_INFO(
+          "NativeCommandProcessor: switch_cloud_skip=v1 rejected unmapped candidate "
+          "(fetch_constant={} base={:08X})",
+          binding.fetch_constant, base_address);
+      continue;
+    }
+    const uint64_t content_hash = XXH3_64bits(source, kSwitchCloudSourceSize);
+    if (content_hash == kSwitchCloudContentHash) {
+      switch_cloud_texture_base_address_ = base_address;
+      samples_confirmed_cloud = true;
+      REXGPU_INFO(
+          "NativeCommandProcessor: switch_cloud_skip=v1 confirmed new_CloudsTop "
+          "(fetch_constant={} base={:08X} {}x{} pitch={} format={} hash={:016X})",
+          binding.fetch_constant, base_address, width, height, pitch,
+          static_cast<uint32_t>(fetch.format), content_hash);
+      break;
+    }
+
+    // Never repeatedly hash a same-shaped false positive every frame.
+    switch_rejected_cloud_texture_bases_.insert(base_address);
+    REXGPU_INFO(
+        "NativeCommandProcessor: switch_cloud_skip=v1 rejected metadata-only candidate "
+        "(fetch_constant={} base={:08X} hash={:016X})",
+        binding.fetch_constant, base_address, content_hash);
+  }
+
+  if (samples_confirmed_cloud) {
+    ++switch_cloud_draws_skipped_;
+    // A first-hit marker proves the path is live immediately; the sparse
+    // cumulative markers make longer hardware captures self-quantifying
+    // without adding a log line (or an atomic profiler update) every frame.
+    if (switch_cloud_draws_skipped_ == 1 || switch_cloud_draws_skipped_ % 600 == 0) {
+      REXGPU_INFO("NativeCommandProcessor: switch_cloud_skip=v1 skipped_draws={}",
+                  switch_cloud_draws_skipped_);
+    }
+    return;
+  }
+#endif
+
   // F2 profiling (see SetShaderProfilingEnabled): times everything from here
   // to the end of TryDraw (pipeline/descriptor setup + vkCmdDraw*), i.e. the
   // actual per-draw submission cost, not shader translation/analysis above
@@ -3716,7 +4298,9 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
     return;
   }
 
-  EnsureFrameBegun();
+  if (!EnsureFrameBegun()) {
+    return;
+  }
 
   // Mirror only the vertex fetch constant ranges this shader pair actually
   // reads into shared memory (not a blanket copy) -- see UpdateSharedMemory.
@@ -4141,6 +4725,7 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
   dfn.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_entry.pipeline);
   dfn.vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                               pipeline_entry.layout, 0, 4, sets, 0, nullptr);
+  bool draw_issued = false;
   // Shared by both synthesized-index-buffer paths below: uploads `indices`
   // into the persistently-mapped index arena (see the index_arena_* members'
   // doc) and issues the indexed draw at that offset. Falls back to a
@@ -4155,6 +4740,7 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
                                VK_INDEX_TYPE_UINT32);
       index_arena_offset_ += index_buffer_size;
       dfn.vkCmdDrawIndexed(command_buffer_, uint32_t(indices.size()), 1, 0, 0, 0);
+      draw_issued = true;
       return;
     }
     VkBuffer index_buffer;
@@ -4174,6 +4760,7 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
 
     dfn.vkCmdBindIndexBuffer(command_buffer_, index_buffer, 0, VK_INDEX_TYPE_UINT32);
     dfn.vkCmdDrawIndexed(command_buffer_, uint32_t(indices.size()), 1, 0, 0, 0);
+    draw_issued = true;
   };
 
   if (is_tessellated_quad) {
@@ -4192,6 +4779,7 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
                            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 0, sizeof(float),
                            &tessellation_factor);
     dfn.vkCmdDraw(command_buffer_, num_indices, 1, 0, 0);
+    draw_issued = true;
   } else if (is_quad_list) {
     // Two triangles per quad (0,1,2,0,2,3), indexing the same autoindex
     // vertex stream a non-indexed draw of this quad list would have used --
@@ -4233,6 +4821,12 @@ void NativeCommandProcessor::TryDraw(rex::graphics::xenos::PrimitiveType prim_ty
     draw_with_synthesized_indices(indices);
   } else {
     dfn.vkCmdDraw(command_buffer_, num_indices, 1, 0, 0);
+    draw_issued = true;
+  }
+
+  if (draw_issued) {
+    SwitchPerfAdd(5, 1);
+    SwitchPerfAdd(85, SwitchPerfTick() - draw_start);
   }
 
   frame_has_draws_ = true;
@@ -4251,6 +4845,7 @@ void NativeCommandProcessor::PresentFrame() {
   if (command_buffer_ == VK_NULL_HANDLE) {
     return;
   }
+  SwitchPerfScope present_timer(96);
 
   // Scaled by the guest clock's time scalar (see rex::chrono::Clock::
   // set_guest_time_scalar, used by src/fast_forward.h) so this real-time
@@ -4283,7 +4878,9 @@ void NativeCommandProcessor::PresentFrame() {
   }
   auto deadline = last_present_time_ + interval;
   if (now < deadline) {
+    const uint64_t pacer_sleep_start = SwitchPerfTick();
     std::this_thread::sleep_for(deadline - now);
+    SwitchPerfAdd(100, SwitchPerfTick() - pacer_sleep_start);
     last_present_time_ = deadline;
   } else {
     // Fell a whole interval behind (a real hitch, or guest_time_scalar/refresh
@@ -4293,7 +4890,9 @@ void NativeCommandProcessor::PresentFrame() {
 
   // Guarantees a valid recording command buffer + cleared color target even
   // if this frame had zero (or all-skipped) draws.
-  EnsureFrameBegun();
+  if (!EnsureFrameBegun()) {
+    return;
+  }
 
   // Fast-forward frame-skip: the guest's mode loop calls PresentFrame once
   // per logic iteration, so without this gate, real GPU present work below would run every single
@@ -4326,30 +4925,38 @@ void NativeCommandProcessor::PresentFrame() {
 
     const rex::ui::vulkan::VulkanDevice* vulkan_device = provider_->vulkan_device();
     const rex::ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    VkDevice device = vulkan_device->device();
+
+    // Normally texture uploads are flushed immediately before their draw.
+    // Also drain anything left by an early-out draw before this final submit.
+    FlushPendingSharedMemoryCopies();
 
     // Flush all of this frame's constant-buffer writes to the arena in one call
     // (kUpload memory is only guaranteed host-visible, not coherent -- see the
     // FlushMapped comment), replacing the old per-buffer flush. Must happen
     // before the command buffer that reads the arena is submitted below.
     if (constants_arena_offset_ > 0) {
-      FlushMapped(vulkan_device, constants_arena_memory_);
+      FlushMappedPrefix(vulkan_device, constants_arena_memory_, constants_arena_offset_,
+                        kConstantsArenaSize);
     }
     if (index_arena_offset_ > 0) {
-      FlushMapped(vulkan_device, index_arena_memory_);
+      FlushMappedPrefix(vulkan_device, index_arena_memory_, index_arena_offset_, kIndexArenaSize);
     }
     if (shared_memory_staging_offset_ > 0) {
-      FlushMapped(vulkan_device, shared_memory_staging_memory_);
+      FlushMappedPrefix(vulkan_device, shared_memory_staging_memory_,
+                        shared_memory_staging_offset_, kSharedMemoryStagingSize);
     }
 
     // Render pass's finalLayout is already TRANSFER_SRC_OPTIMAL, so
     // color_target_image_ needs no barrier before the blit below.
     dfn.vkCmdEndRenderPass(command_buffer_);
 
+    bool refresh_callback_invoked = false;
+    bool refresh_callback_submitted = false;
     bool refreshed = presenter_->RefreshGuestOutput(
       color_target_width_, color_target_height_, color_target_width_, color_target_height_,
-      [this, vulkan_device, &dfn, device](
+      [this, vulkan_device, &dfn, &refresh_callback_invoked, &refresh_callback_submitted](
           rex::ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+        refresh_callback_invoked = true;
         auto& vulkan_context =
             static_cast<rex::ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(
                 context);
@@ -4379,37 +4986,19 @@ void NativeCommandProcessor::PresentFrame() {
                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire_barrier);
 
-        // Copy the offscreen render target (draws accumulated into it this
-        // frame, or just the clear color if there were none) into the guest
-        // output image, relayed through a staging buffer: neither
-        // vkCmdBlitImage nor vkCmdCopyImage (image-to-image) is in this
-        // SDK's exposed Vulkan function table, only buffer<->image copies
-        // are. This is exact (no scaling/format conversion needed) since both
-        // color_target_image_ and the guest output image are created at
-        // color_target_width_ x color_target_height_, in kGuestOutputFormat
-        // (VK_FORMAT_A2B10G10R10_UNORM_PACK32).
-        VkBufferImageCopy buffer_image_copy{};
-        buffer_image_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        buffer_image_copy.imageExtent = {color_target_width_, color_target_height_, 1};
-        dfn.vkCmdCopyImageToBuffer(command_buffer_, color_target_image_,
-                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   color_target_staging_buffer_, 1, &buffer_image_copy);
-
-        VkBufferMemoryBarrier staging_barrier{};
-        staging_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        staging_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        staging_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        staging_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        staging_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        staging_barrier.buffer = color_target_staging_buffer_;
-        staging_barrier.size = color_target_staging_size_;
-        dfn.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staging_barrier,
-                                 0, nullptr);
-
-        dfn.vkCmdCopyBufferToImage(command_buffer_, color_target_staging_buffer_,
-                                   vulkan_context.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                                   &buffer_image_copy);
+        // Both images have identical extents and kGuestOutputFormat, so keep
+        // this transfer entirely in device-local image memory. The original
+        // milestone path bounced every 1280x720 frame through a host-visible
+        // staging buffer because it assumed vkCmdCopyImage was unavailable.
+        // The SDK function table exposes it now, and avoiding the image ->
+        // buffer -> image round trip is especially important on Switch/NVK.
+        VkImageCopy image_copy{};
+        image_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        image_copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        image_copy.extent = {color_target_width_, color_target_height_, 1};
+        dfn.vkCmdCopyImage(command_buffer_, color_target_image_,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vulkan_context.image(),
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
 
         // Release barrier: back to the layout/stage/access the presenter
         // expects to take over from (see VulkanPresenter::kGuestOutputInternal*).
@@ -4448,28 +5037,31 @@ void NativeCommandProcessor::PresentFrame() {
           rex::ui::vulkan::VulkanDevice::Queue::Acquisition queue =
               vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
           submit_result = dfn.vkQueueSubmit(queue.queue(), 1, &submit_info, submit_fence_);
+          SwitchPerfAdd(7, 1);
         }
         if (submit_result != VK_SUCCESS) {
           REXGPU_ERROR("NativeCommandProcessor: vkQueueSubmit failed ({})",
                        static_cast<int32_t>(submit_result));
           return false;
         }
+        submit_fence_pending_ = true;
+        refresh_callback_submitted = true;
 
-        // The refresher contract requires all submitted work (including the
-        // release barrier's signaling) to complete before returning true;
-        // simplest correct option for this milestone is a blocking wait.
-        constexpr uint64_t kFenceTimeoutNs = 5'000'000'000ull;
-        if (dfn.vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, kFenceTimeoutNs) !=
-            VK_SUCCESS) {
-          REXGPU_ERROR("NativeCommandProcessor: timed out waiting for this frame's fence");
-          return false;
-        }
+        // RefreshGuestOutput requires the update to be submitted before this
+        // callback returns, not completed on the CPU. VulkanPresenter queues
+        // its own tracking fence on this same queue immediately afterward, so
+        // publishing the mailbox image remains ordered after this copy. Keep
+        // submit_fence_ asynchronous here: EnsureFrameBegun waits for it before
+        // reusing the command buffer and transient frame resources, allowing
+        // the next guest logic iteration to overlap this frame's GPU work.
 
         static bool logged_first_present = false;
         if (!logged_first_present) {
           logged_first_present = true;
-          REXGPU_INFO("NativeCommandProcessor: first frame presented (had_draws={})",
-                      frame_has_draws_);
+          REXGPU_INFO(
+              "NativeCommandProcessor: first frame presented (had_draws={}, direct_copy=true, "
+              "async_fence=true)",
+              frame_has_draws_);
         }
 
         return true;
@@ -4479,6 +5071,24 @@ void NativeCommandProcessor::PresentFrame() {
       if (!logged_refresh_failure) {
         logged_refresh_failure = true;
         REXGPU_ERROR("NativeCommandProcessor: RefreshGuestOutput failed");
+      }
+    }
+
+    if (!refresh_callback_submitted) {
+      // RefreshGuestOutput may fail before invoking the callback (for
+      // example, while creating its image). Finish the still-recording
+      // command buffer so it can be reset next frame. If the callback ran,
+      // it already ended the buffer before the failed vkQueueSubmit.
+      if (!refresh_callback_invoked) {
+        dfn.vkEndCommandBuffer(command_buffer_);
+      }
+      // Queued preview copies were recorded but never executed. Preserve the
+      // image allocation, but force its contents to be refreshed next frame.
+      for (auto& cache_entry : texture_cache_) {
+        UploadedTexture& texture = cache_entry.second;
+        if (texture.reusable_gameplay_preview) {
+          texture.dirty = true;
+        }
       }
     }
 

@@ -14,6 +14,7 @@
 #include <rex/cvar.h>
 #include <rex/discord_rpc.h>
 #include <rex/input/input_system.h>
+#include <rex/platform.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/system/game_data_selector.h>
@@ -41,7 +42,9 @@
 #include "native_options.h"
 #include "headless_gpu_bridge.h"
 #include "host_timer_resolution.h"
+#if !REX_PLATFORM_SWITCH
 #include "icon.generated.h"
+#endif
 #include "native_command_processor.h"
 #include "native_immediate_drawer.h"
 #include "rando_xex.h"
@@ -51,6 +54,12 @@
 #include "version.generated.h"
 
 #include <rex/system/kernel_state.h>
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+extern "C" void RexSwitchPerfCount(unsigned id);
+extern "C" void RexGmSetReadOnlyMapped(bool enabled);
+#endif
 
 // Single on/off vsync toggle for this renderer, layered on top of the SDK's
 // vulkan_allow_present_mode_immediate cvar (vulkan_presenter.cpp): disabling
@@ -92,12 +101,20 @@ class NocturnerecompApp : public rex::ReXApp {
     // build (never a vanilla one, and vice versa) since the two patch
     // different base addresses so the asset name itself encodes which
     // variant this binary is.
-#ifdef NOCTURNE_TU
+#if REX_PLATFORM_SWITCH
+    // Horizon updates are distributed as NROs and installed manually. The
+    // desktop upstream publishes no compatible Switch asset, and the Switch
+    // runtime intentionally has no replace-and-relaunch implementation.
+    config.update_repo.clear();
+    config.update_asset_format.clear();
+#elif defined(NOCTURNE_TU)
     config.update_asset_format = "nocturnerecomp-tu-{tag}-{platform}";
 #else
     config.update_asset_format = "nocturnerecomp-{tag}-{platform}";
 #endif
+#if !REX_PLATFORM_SWITCH
     config.update_repo = "birabittoh/NocturneRecomp";
+#endif
 
     // One-shot toast shown top-left as the game starts
     config.startup_hint = "Press F4 to open settings.";
@@ -106,6 +123,22 @@ class NocturnerecompApp : public rex::ReXApp {
     // on gpu_plugin being unset -- this is the documented entry point for
     // bringing your own renderer via OnCreateImmediateDrawer/OnPreLaunchModule.
     config.graphics = nullptr;
+#if REX_PLATFORM_SWITCH
+    // A Switch NRO cannot load a desktop plugin, and this target deliberately
+    // does not link rexgpu-xenos. Ignore a stale desktop config and always use
+    // NocturneRecomp's in-process native renderer on Horizon.
+    config.gpu_plugin.clear();
+
+    // The native/headless renderer uploads guest memory directly and never
+    // installs the SDK SharedMemory write watches. Keep the guest's logically
+    // read-only pages mapped, just like project8-sw's NativeGraphicsSystem.
+    // Otherwise Horizon has to emulate every read through an exception: SotN's
+    // software-rendering loops generate over 200,000 such faults per second,
+    // which slows the videos and leaves the loading screen CPU-bound.
+    // This must happen before Runtime loads the XEX so its existing read-only
+    // sections are mapped normally from the start.
+    RexGmSetReadOnlyMapped(true);
+#endif
   }
 
   // Redirect the boot module to a randomizer-patched xex (rando_xex_name
@@ -175,6 +208,16 @@ class NocturnerecompApp : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
+    // Shared Application singleton used by the optional fixed-step pacer and
+    // by the Switch profiler's simulation-rate counter. Give a game-symbols
+    // mod first chance to register/override it, then provide the built-in
+    // vanilla/TU2 pair for the normal no-mod case. This must precede
+    // GetFramePacer().Bind below.
+    auto* mod_registry = runtime()->mod_registry();
+    if (!mod_registry->FindAddress("app.singleton_ptr")) {
+      mod_registry->RegisterAddress("app.singleton_ptr", 0x82E4F808u, 0x82E4F5C8u);
+    }
+
     // Runs the settings overlay's GPU plugin / Vulkan device enumeration now,
     // rather than paying for it on the player's first F4 press (the SDK
     // destroys and recreates the overlay on every close/open, so without this
@@ -189,7 +232,9 @@ class NocturnerecompApp : public rex::ReXApp {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime()->input_system());
     nocturne::Achievements().Bind(window(), &app_context(), input_sys);
 
+#if !REX_PLATFORM_SWITCH
     window()->SetIcon(nocturne::kIconPNG, nocturne::kIconPNGSize);
+#endif
 
     // The SDK titles the window after the app identifier ("nocturnerecomp",
     // lowercase, since that name also drives the config file and user data
@@ -362,7 +407,17 @@ class NocturnerecompApp : public rex::ReXApp {
     // decoupling, see src/fast_forward.h) instead of replacing it, roughly
     // doubling per-frame time.
     // Mailbox is tear-free but non-blocking, so it doesn't double-count.
+#if REX_PLATFORM_SWITCH
+    // Mesa's Switch WSI exposes only FIFO and IMMEDIATE. With the default
+    // `vsync=true`, the desktop-oriented mailbox preference above therefore
+    // falls through to FIFO, whose queue waits stack with PresentFrame's own
+    // deterministic guest pacer and quantize gameplay to 15/20/30 fps. Keep
+    // the explicit guest pacer as the single timing source and use IMMEDIATE
+    // for the host swapchain on Horizon.
+    REXCVAR_SET(vulkan_allow_present_mode_immediate, true);
+#else
     REXCVAR_SET(vulkan_allow_present_mode_immediate, !REXCVAR_GET(vsync));
+#endif
 
     // If a gpu_plugin cvar was set (e.g. "xenos"), ReXApp::SetupPresentation
     // already loaded that plugin as config_.graphics and ran its own
@@ -481,8 +536,36 @@ class NocturnerecompApp : public rex::ReXApp {
       // mod's own RegisterTick calls). Drive it directly from this
       // renderer's own swap point instead, or every per-frame tick (F3's
       // guest FPS included) silently never fires.
-      native_command_processor_->SetOnFramePresented(
-          [this] { runtime()->mod_registry()->DispatchTick(); });
+      native_command_processor_->SetOnFramePresented([this] {
+#if REX_PLATFORM_SWITCH
+        // Guest FPS is a present count, but SotN may execute multiple fixed
+        // 5-unit updates between presents. Publish the actual game_time delta
+        // so the profiler can report simulation Hz independently of rendering.
+        static bool have_last_game_time = false;
+        static int32_t last_game_time = 0;
+        int32_t game_time = 0;
+        if (nocturne::TryReadGameTime(runtime(), &game_time)) {
+          if (have_last_game_time) {
+            int64_t delta = int64_t(game_time) - int64_t(last_game_time);
+            // Re-anchor across game teardown/reset or an implausibly long gap
+            // rather than turning it into a bogus update-rate spike.
+            if (delta >= 0 && delta <= 300) {
+              RexSwitchPerfAdd(99, static_cast<uint64_t>(delta));
+            }
+          }
+          last_game_time = game_time;
+          have_last_game_time = true;
+        } else {
+          have_last_game_time = false;
+        }
+
+        // The normal GraphicsSystem reports every IssueSwap to the Switch
+        // profiler. Native/headless rendering bypasses that path, so publish
+        // the same guest-frame event here as well.
+        RexSwitchPerfCount(0);
+#endif
+        runtime()->mod_registry()->DispatchTick();
+      });
 
       // Feed the F2 shader debugger overlay from NativeCommandProcessor's own
       // shader cache -- this renderer has no GraphicsSystem/CommandProcessor,

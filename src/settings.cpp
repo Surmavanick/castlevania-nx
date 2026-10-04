@@ -36,6 +36,16 @@ namespace nocturne {
 
 namespace {
 
+#if REX_PLATFORM_SWITCH
+constexpr const char* kDefaultGpuPlugin = "";
+// Resolve game/ (or the fallback assets/) relative to the actual NRO path in
+// GameDataSelector. A bare relative default depends on hbloader's cwd.
+constexpr const char* kDefaultGameDataRoot = "";
+#else
+constexpr const char* kDefaultGpuPlugin = "xenos";
+constexpr const char* kDefaultGameDataRoot = "assets";
+#endif
+
 // Everything build.py used to write into the shipped nocturnerecomp.toml.
 // These are the game's defaults, not necessarily the SDK's; kept here so
 // there is one place that owns "what NocturneRecomp ships with". Keybind/
@@ -50,7 +60,7 @@ struct DefaultValue {
 constexpr std::array kGameDefaults = {
     DefaultValue{"user_name", "Player"},
     DefaultValue{"user_language", "1"},
-    DefaultValue{"gpu_plugin", "xenos"},
+    DefaultValue{"gpu_plugin", kDefaultGpuPlugin},
     DefaultValue{"gpu_backend", "any"},
     DefaultValue{"fullscreen", "false"},
     DefaultValue{"resolution", "720p"},
@@ -87,7 +97,7 @@ constexpr std::array kGameDefaults = {
     DefaultValue{"remap_left_trigger", "left_trigger"},
     DefaultValue{"rando_xex_name", "Rando.xex"},
     DefaultValue{"gpu_allow_invalid_fetch_constants", "true"},
-    DefaultValue{"game_data_root", "assets"},
+    DefaultValue{"game_data_root", kDefaultGameDataRoot},
     DefaultValue{"update_data_root", "update"},
     DefaultValue{"mods_data_root", "mods"},
     DefaultValue{"license_mask", "1"},

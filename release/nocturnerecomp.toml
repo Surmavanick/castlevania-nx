@@ -1,0 +1,32 @@
+# Castlevania-NX release configuration.
+#
+# libnx exposes the SD card as the POSIX root. Use /switch/... here, not an
+# sdmc:/ prefix. Keep this file named nocturnerecomp.toml next to the NRO.
+
+game_data_root = "/switch/castlevania-nx/game"
+user_data_root = "/switch/castlevania-nx/nocturnerecomp"
+cache_root = "/switch/castlevania-nx/nocturnerecomp/cache"
+update_data_root = ""
+mods_data_root = "/switch/castlevania-nx/mods"
+
+# The Switch target uses NocturneRecomp's in-process native renderer. A desktop
+# Xenos plugin cannot be loaded from an NRO.
+gpu_plugin = ""
+
+# Optional and disabled by default. If crt.slang is not installed, leaving the
+# effect disabled avoids trying to use it.
+post_process_shader_path = "/switch/castlevania-nx/shaders/crt.slang"
+post_process_shader_enabled = false
+
+# Keep logically read-only guest pages mapped and detect writes at the normal
+# frame boundary. This avoids the hot Horizon exception path measured during
+# video/loading and is part of the validated configuration.
+switch_unwatch_hot_reads = true
+
+# The native presenter already consumes this exact full-screen frontbuffer.
+# Set this to false only as a diagnostic if a future scene shows corruption.
+switch_skip_redundant_frontbuffer_resolve = true
+
+# false maps Switch A/B/X/Y to the Xbox buttons with the same letters.
+# true maps them by physical position instead.
+input_xbox_layout = false
